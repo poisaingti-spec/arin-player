@@ -8,6 +8,7 @@ import com.arin.player.data.Cue
 import com.arin.player.data.EngineMode
 import com.arin.player.data.Settings
 import com.arin.player.data.SubtitleCache
+import com.arin.player.data.Word
 import com.arin.player.online.PlaybackSource
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -24,18 +25,23 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.videolan.libvlc.LibVLC
-import java.io.IOException
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
+import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sqrt
 
 /**
- * Splits the video's audio into 30 s chunks and turns each into English subtitles.
+ * Turns the WHOLE video's audio into English subtitles, any length.
  *
- *  - Chunks at/just ahead of the playback position are done first, so subtitles are ready
- *    before you reach them; seeking re-prioritises instantly.
- *  - Every chunk gets its own language detection, so videos that switch languages work.
- *  - Segment timestamps from Whisper are offset by the chunk start -> cues line up with speech.
+ *  - Audio is processed in ~30 s pieces, starting where you're watching, then the rest of the video
+ *    (after the end it wraps round to the beginning) until every piece is done.
+ *  - Piece edges are moved to the quietest moment nearby, so no word is cut in half.
+ *  - Each line is timed from word timestamps, then snapped to the actual start/end of the voice.
+ *  - Every piece gets its own language detection, so videos that switch languages work.
+ *  - A piece that fails is retried later instead of blocking the rest; in Auto mode the offline
+ *    model takes over when the cloud is unreachable or out of quota.
  *  - Results are cached per video.
  */
 class SubtitleEngine(
@@ -46,8 +52,11 @@ class SubtitleEngine(
 ) {
     companion object {
         const val CHUNK_MS = 30_000L
-        /** How far ahead of playback to translate (6 × 30 s = 3 min). */
-        const val LOOKAHEAD = 6
+        /** How far a piece edge may move to find a quiet moment. */
+        const val EDGE_SEARCH_MS = 2_500L
+        /** Keep a line on screen a little after the voice stops (easier to read). */
+        const val HOLD_MS = 350L
+        const val MIN_SHOW_MS = 900L
     }
 
     private val ctx = context.applicationContext
@@ -62,10 +71,12 @@ class SubtitleEngine(
     val progress = MutableStateFlow(0f)
 
     @Volatile private var positionMs = 0L
-    @Volatile private var fullMode = false
     private var durationMs = 0L
     private var done = BooleanArray(0)
     private val inFlight = mutableSetOf<Int>()
+    /** chunk -> time it last failed, so a failing piece doesn't block the rest of the video. */
+    private val failedAt = ConcurrentHashMap<Int, Long>()
+    private val edges = ConcurrentHashMap<Int, Long>()
     private var key = ""
     private var job: Job? = null
     private val wake = Channel<Unit>(Channel.CONFLATED)
@@ -88,7 +99,7 @@ class SubtitleEngine(
             publish(c)
         }
         job = scope.launch(Dispatchers.Default) {
-            // 2 workers: while one waits on the network/model, the other decodes the next chunk.
+            // 2 workers: while one waits on the network/model, the other decodes the next piece.
             repeat(2) { launch { workerLoop() } }
         }
     }
@@ -96,11 +107,8 @@ class SubtitleEngine(
     fun onPosition(ms: Long) {
         val old = positionMs
         positionMs = ms
-        if (abs(ms - old) > 5_000) wake.trySend(Unit) // seek
+        if (abs(ms - old) > 5_000) wake.trySend(Unit) // seek -> re-prioritise
     }
-
-    /** Translate the whole video (e.g. before exporting an .srt), not just what's ahead. */
-    fun generateAll() { fullMode = true; wake.trySend(Unit) }
 
     fun stop() {
         job?.cancel()
@@ -115,65 +123,106 @@ class SubtitleEngine(
             val i = nextChunk()
             if (i == null) {
                 idleStatus()
-                withTimeoutOrNull(1_000) { wake.receive() }
+                withTimeoutOrNull(2_000) { wake.receive() }
                 continue
             }
             try {
                 process(i)
+                failedAt.remove(i)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 synchronized(this) { inFlight -= i }
+                failedAt[i] = System.currentTimeMillis()
                 status.value = "⚠ " + (e.message ?: e.javaClass.simpleName)
-                delay(5_000) // retry later (e.g. after the user fixes Settings or goes online)
+                delay(3_000)
             }
         }
     }
 
+    /** Current position first, then onward to the end, then the beginning: the whole video. */
     private fun nextChunk(): Int? = synchronized(this) {
         if (done.isEmpty()) return null
-        val cur = (positionMs / CHUNK_MS).toInt().coerceIn(0, done.size - 1)
-        val limit = if (fullMode) done.size else min(done.size, cur + LOOKAHEAD)
-        val pick = (cur until limit).firstOrNull { !done[it] && it !in inFlight }
-            ?: if (fullMode) (0 until cur).firstOrNull { !done[it] && it !in inFlight } else null
+        val n = done.size
+        val cur = (positionMs / CHUNK_MS).toInt().coerceIn(0, n - 1)
+        val now = System.currentTimeMillis()
+        fun ready(i: Int) = !done[i] && i !in inFlight && (failedAt[i]?.let { now - it > 60_000 } ?: true)
+        val pick = ((cur until n) + (0 until cur)).firstOrNull { ready(it) }
         pick?.also { inFlight += it }
     }
 
     private suspend fun process(i: Int) {
-        val start = i * CHUNK_MS
-        val end = min(durationMs, start + CHUNK_MS)
+        val start = edge(i)
+        val end = edge(i + 1)
         status.value = "Listening ${fmt(start)}–${fmt(end)}"
 
         val pcm = readAudio(start, end)
         if (pcm == null) {
-            markDone(i, emptyList())
+            markDone(i, start, end, emptyList())
             status.value = "No audio track found"
             return
         }
-        // Silence / music-free gaps: skip (saves API cost and avoids hallucinated lines).
-        if (pcm.size < SAMPLE_RATE / 2 || rms(pcm) < 0.004f) {
-            markDone(i, emptyList()); return
+        // Total silence: nothing to subtitle (saves API cost and avoids hallucinated lines).
+        if (pcm.size < SAMPLE_RATE / 2 || rms(pcm) < 0.0015f) {
+            markDone(i, start, end, emptyList()); return
         }
 
         val t = pickTranscriber()
-        status.value = "Translating ${fmt(start)}–${fmt(end)} (${t.label})"
+        status.value = "Subtitling ${fmt(start)}–${fmt(end)} (${t.label})"
         val result = try {
             t.translate(pcm)
-        } catch (e: IOException) {
-            // Network dropped mid-way: in Auto mode, fall back to the offline model if we have one.
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // Cloud unreachable / out of quota: in Auto mode keep going with the offline model.
             val local = local()
             if (settings.mode == EngineMode.AUTO && t is CloudTranscriber && local != null) {
                 status.value = "Offline fallback ${fmt(start)}–${fmt(end)}"
                 local.translate(pcm)
-            } else throw IOException("No internet connection")
+            } else throw e
         }
 
-        val newCues = result.segments.mapNotNull { s ->
-            val cs = start + s.startMs
-            val ce = min(start + s.endMs, end + 1_000)
-            if (ce <= cs) null else Cue(cs, ce, s.text, result.lang)
+        val voice = VoiceMap(pcm)
+        val refined = result.lines.map { l -> voice.refine(l) }
+        val newCues = refined.mapIndexedNotNull { idx, l ->
+            if (l.text.isBlank()) return@mapIndexedNotNull null
+            val nextStart = refined.getOrNull(idx + 1)?.startMs ?: Long.MAX_VALUE
+            val s = start + l.startMs
+            // Show until the voice stops (+ a short hold), at least MIN_SHOW, never over the next line.
+            val e = start + min(max(l.endMs + HOLD_MS, l.startMs + MIN_SHOW_MS), nextStart - 40)
+            if (e <= s) null
+            else Cue(s, e, l.text, result.lang, l.words.map { w -> Word(start + w.startMs, start + w.endMs, w.text) })
         }
-        markDone(i, newCues)
+        markDone(i, start, end, newCues)
+    }
+
+    /** Start of piece [k]: near k × 30 s, moved to the quietest 200 ms within ±2.5 s. */
+    private suspend fun edge(k: Int): Long {
+        if (k <= 0) return 0
+        if (k >= done.size) return durationMs
+        edges[k]?.let { return it }
+        val center = k * CHUNK_MS
+        val from = max(0, center - EDGE_SEARCH_MS)
+        val to = min(durationMs, center + EDGE_SEARCH_MS)
+        val pcm = runCatching { readAudio(from, to) }.getOrNull()
+        val win = SAMPLE_RATE / 5 // 200 ms
+        val step = SAMPLE_RATE / 50 // 20 ms
+        var best = center
+        if (pcm != null && pcm.size > win) {
+            var bestE = Double.MAX_VALUE
+            var p = 0
+            while (p + win <= pcm.size) {
+                var e = 0.0
+                for (j in p until p + win) e += pcm[j] * pcm[j]
+                // slight preference for staying near the 30 s mark
+                val tMs = from + (p + win / 2) * 1000L / SAMPLE_RATE
+                e *= 1.0 + abs(tMs - center) / 10_000.0
+                if (e < bestE) { bestE = e; best = tMs }
+                p += step
+            }
+        }
+        edges[k] = best
+        return best
     }
 
     private suspend fun readAudio(startMs: Long, endMs: Long): FloatArray? {
@@ -194,7 +243,7 @@ class SubtitleEngine(
         EngineMode.CLOUD -> cloud() ?: throw IllegalStateException("Add a cloud API key in Settings")
         EngineMode.OFFLINE -> local() ?: throw IllegalStateException("Download an offline model in Settings")
         EngineMode.AUTO -> (if (online()) cloud() else null) ?: local()
-            ?: if (cloud() != null) throw IOException("Offline — download an offline model in Settings")
+            ?: if (cloud() != null) throw IllegalStateException("Offline — download an offline model in Settings")
             else throw IllegalStateException("Add an API key or download an offline model in Settings")
     }
 
@@ -202,7 +251,7 @@ class SubtitleEngine(
         settings.apiKey().takeIf { it.isNotBlank() }?.let { CloudTranscriber(settings.provider, it) }
 
     private fun local(): Transcriber? =
-        settings.localModel.takeIf { models.isReady(it) }?.let { LocalTranscriber(models.file(it)) }
+        settings.localModel.takeIf { models.isReady(it) }?.let { LocalTranscriber(models.file(it), it) }
 
     private fun online(): Boolean {
         val cm = ctx.getSystemService(ConnectivityManager::class.java) ?: return false
@@ -210,11 +259,10 @@ class SubtitleEngine(
         return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     }
 
-    private fun markDone(i: Int, newCues: List<Cue>) = synchronized(this) {
+    private fun markDone(i: Int, start: Long, end: Long, newCues: List<Cue>) = synchronized(this) {
         done[i] = true
         inFlight -= i
-        val start = i * CHUNK_MS
-        val merged = cues.value.filterNot { it.startMs >= start && it.startMs < start + CHUNK_MS } + newCues
+        val merged = cues.value.filterNot { it.startMs >= start && it.startMs < end } + newCues
         publish(merged)
         runCatching { cache.save(key, done.indices.filter { done[it] }.toSet(), cues.value) }
     }
@@ -227,12 +275,13 @@ class SubtitleEngine(
     }
 
     private fun idleStatus() {
-        val all = synchronized(this) { done.isNotEmpty() && done.all { it } }
-        if (status.value.startsWith("⚠")) return
+        val (all, failed) = synchronized(this) { (done.isNotEmpty() && done.all { it }) to failedAt.size }
+        if (status.value.startsWith("⚠") && failed > 0) return
         status.value = when {
             done.isEmpty() -> status.value
             all -> "✓ Subtitles ready for the whole video"
-            else -> "✓ Subtitles ready ahead"
+            failed > 0 -> "Retrying $failed part(s) shortly…"
+            else -> status.value
         }
     }
 
@@ -240,5 +289,58 @@ class SubtitleEngine(
         val s = ms / 1000
         return if (s >= 3600) String.format(Locale.US, "%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60)
         else String.format(Locale.US, "%d:%02d", s / 60, s % 60)
+    }
+}
+
+/**
+ * Simple voice-activity map of a piece (20 ms frames). Used to snap each line's start to the moment
+ * the voice actually begins and its end to when it stops.
+ */
+private class VoiceMap(pcm: FloatArray) {
+    private val frameMs = 20
+    private val frame = SAMPLE_RATE * frameMs / 1000
+    private val voiced: BooleanArray
+
+    init {
+        val n = pcm.size / frame
+        val energy = FloatArray(n) { f ->
+            var s = 0.0
+            for (j in f * frame until (f + 1) * frame) s += pcm[j] * pcm[j]
+            sqrt(s / frame).toFloat()
+        }
+        val sorted = energy.sorted()
+        val noise = if (sorted.isEmpty()) 0f else sorted[(sorted.size * 0.15).toInt().coerceIn(0, sorted.size - 1)]
+        val loud = if (sorted.isEmpty()) 0f else sorted[(sorted.size * 0.9).toInt().coerceIn(0, sorted.size - 1)]
+        val thr = max(noise * 2.5f, noise + (loud - noise) * 0.12f).coerceAtLeast(0.004f)
+        voiced = BooleanArray(n) { energy[it] > thr }
+    }
+
+    private fun isVoiced(ms: Long): Boolean {
+        val f = (ms / frameMs).toInt()
+        return f in voiced.indices && voiced[f]
+    }
+
+    fun refine(l: Line): Line {
+        if (voiced.isEmpty()) return l
+        var s = l.startMs
+        var e = l.endMs
+        // Start: if the timestamp falls in silence, move forward to where the voice begins (max 0.6 s);
+        // if it's already in voice, step back to the true onset (max 0.25 s).
+        if (!isVoiced(s)) {
+            var t = s
+            while (t < s + 600 && t < e - 200 && !isVoiced(t)) t += frameMs
+            if (isVoiced(t)) s = t
+        } else {
+            var t = s
+            while (t > l.startMs - 250 && t > 0 && isVoiced(t - frameMs)) t -= frameMs
+            s = t
+        }
+        // End: if it falls in silence, pull back to where the voice stopped (max 0.6 s).
+        if (!isVoiced(e)) {
+            var t = e
+            while (t > e - 600 && t > s + 300 && !isVoiced(t)) t -= frameMs
+            if (isVoiced(t)) e = t + frameMs
+        }
+        return l.copy(startMs = s, endMs = max(e, s + 200))
     }
 }

@@ -78,6 +78,9 @@ import org.videolan.libvlc.Media
 import org.videolan.libvlc.MediaPlayer
 import org.videolan.libvlc.util.VLCVideoLayout
 import java.util.Locale
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.TextButton
@@ -296,8 +299,26 @@ private fun PlayerContent(
         // ---- subtitle
         if (subsOn && current != null) {
             val tag = if (showLangTag && current.lang.isNotBlank() && current.lang != "EN") "[${current.lang}] " else ""
+            // English speech: words light up exactly as they're spoken. Translated lines appear whole,
+            // timed to when that line is spoken.
+            val styled = buildAnnotatedString {
+                append(tag)
+                if (current.words.isEmpty()) {
+                    append(current.text)
+                } else {
+                    current.words.forEachIndexed { i, w ->
+                        if (i > 0) append(" ")
+                        val color = when {
+                            posMs >= w.startMs && posMs < w.endMs + 120 -> Color(0xFFFFE066) // being spoken
+                            posMs >= w.startMs -> Color.White                                // already said
+                            else -> Color.White.copy(alpha = 0.55f)                         // coming up
+                        }
+                        withStyle(SpanStyle(color = color)) { append(w.text) }
+                    }
+                }
+            }
             Text(
-                tag + current.text,
+                styled,
                 color = Color.White,
                 fontSize = subSize.sp,
                 textAlign = TextAlign.Center,
@@ -330,7 +351,6 @@ private fun PlayerContent(
                     Box {
                         IconButton(onClick = { menuOpen = true }) { Icon(Icons.Filled.MoreVert, "More", tint = Color.White) }
                         DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                            DropdownMenuItem(text = { Text("Translate whole video") }, onClick = { menuOpen = false; engine.generateAll() })
                             DropdownMenuItem(
                                 text = { Text("Export subtitles (.srt)") },
                                 enabled = cues.isNotEmpty(),

@@ -8,15 +8,27 @@ enum class EngineMode(val label: String, val desc: String) {
     OFFLINE("Offline only", "Runs on the phone, no internet needed"),
 }
 
-enum class CloudProvider(val label: String, val url: String, val model: String, val keyHint: String) {
-    GROQ("Groq (fast, cheap)", "https://api.groq.com/openai/v1/audio/translations", "whisper-large-v3", "console.groq.com/keys"),
-    OPENAI("OpenAI", "https://api.openai.com/v1/audio/translations", "whisper-1", "platform.openai.com/api-keys"),
+enum class CloudProvider(
+    val label: String,
+    val base: String,
+    val model: String,
+    /** Text model that translates the timed lines into English. */
+    val chatModel: String,
+    val keyHint: String,
+) {
+    GROQ("Groq (fast, cheap)", "https://api.groq.com/openai/v1", "whisper-large-v3", "openai/gpt-oss-120b", "console.groq.com/keys"),
+    OPENAI("OpenAI", "https://api.openai.com/v1", "whisper-1", "gpt-4.1-mini", "platform.openai.com/api-keys");
+
+    val transcribeUrl get() = "$base/audio/transcriptions"
+    val translateUrl get() = "$base/audio/translations"
+    val chatUrl get() = "$base/chat/completions"
 }
 
-enum class LocalModel(val label: String, val file: String, val sizeMb: Int, val note: String) {
-    TINY("Tiny", "ggml-tiny.bin", 75, "Fastest, rough translation"),
-    BASE("Base", "ggml-base.bin", 142, "Balanced"),
-    SMALL("Small", "ggml-small.bin", 466, "Best quality, needs a fast phone");
+/** [aheads] = whisper.cpp DTW alignment-heads preset id, for precise word timing. */
+enum class LocalModel(val label: String, val file: String, val sizeMb: Int, val note: String, val aheads: Int) {
+    TINY("Tiny", "ggml-tiny.bin", 75, "Fastest, rough translation", 4),
+    BASE("Base", "ggml-base.bin", 142, "Balanced", 6),
+    SMALL("Small", "ggml-small.bin", 466, "Best quality, needs a fast phone", 8);
 
     val url get() = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$file"
 }
