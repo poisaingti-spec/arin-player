@@ -44,6 +44,13 @@ class Settings(context: Context) {
         get() = p.getFloat("sub_size", 20f)
         set(v) = p.edit().putFloat("sub_size", v).apply()
 
+    /** Last few online video links, newest first. */
+    var recentUrls: List<String>
+        get() = p.getString("recent_urls", "")!!.split('\n').filter { it.isNotBlank() }
+        set(v) = p.edit().putString("recent_urls", v.take(8).joinToString("\n")).apply()
+
+    fun addRecentUrl(url: String) { recentUrls = listOf(url) + recentUrls.filter { it != url } }
+
     var showLanguageTag: Boolean
         get() = p.getBoolean("lang_tag", true)
         set(v) = p.edit().putBoolean("lang_tag", v).apply()

@@ -22,7 +22,20 @@ jobs:
         with:
           gradle-version: "8.11.1"
 
+      - name: Restore signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::Add the KEYSTORE_BASE64 and KEYSTORE_PASSWORD secrets (Settings > Secrets and variables > Actions)"
+            exit 1
+          fi
+          mkdir -p keystore
+          echo "$KEYSTORE_BASE64" | tr -d ' \n\r' | base64 -d > keystore/arin-player.jks
+
       - name: Build release APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
         run: gradle :app:assembleRelease --no-daemon --stacktrace
 
       - uses: actions/upload-artifact@v4
@@ -39,4 +52,5 @@ jobs:
           tag_name: build-${{ github.run_number }}
           name: Arin player build ${{ github.run_number }}
           files: ArinPlayer.apk
+          body: ${{ github.event.head_commit.message }}
           make_latest: true

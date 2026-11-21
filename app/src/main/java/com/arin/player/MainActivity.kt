@@ -18,6 +18,8 @@ import com.arin.player.ui.ArinTheme
 import com.arin.player.ui.HomeScreen
 import com.arin.player.ui.PlayerScreen
 import com.arin.player.ui.SettingsScreen
+import com.arin.player.update.UpdateDialog
+import com.arin.player.update.Updater
 
 class MainActivity : ComponentActivity() {
     private var videoUri by mutableStateOf<Uri?>(null)
@@ -25,6 +27,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         videoUri = uriFrom(intent)
+        Updater.check(silent = true) // quietly look for a newer build on every launch
         setContent {
             ArinTheme {
                 var showSettings by androidx.compose.runtime.remember { mutableStateOf(false) }
@@ -55,6 +58,8 @@ class MainActivity : ComponentActivity() {
                         SettingsScreen(onClose = { showSettings = false; settingsVersion++ })
                     }
                     BackHandler(enabled = uri != null && !showSettings) { videoUri = null }
+                    // Update prompt / download progress, shown over any screen
+                    UpdateDialog()
                 }
             }
         }
@@ -68,8 +73,12 @@ class MainActivity : ComponentActivity() {
     private fun uriFrom(i: Intent?): Uri? = when (i?.action) {
         Intent.ACTION_VIEW -> i.data
         Intent.ACTION_SEND ->
-            if (Build.VERSION.SDK_INT >= 33) i.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
-            else @Suppress("DEPRECATION") i.getParcelableExtra(Intent.EXTRA_STREAM)
+            (if (Build.VERSION.SDK_INT >= 33) i.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+            else @Suppress("DEPRECATION") i.getParcelableExtra(Intent.EXTRA_STREAM))
+                ?: i.getStringExtra(Intent.EXTRA_TEXT)?.let { text ->
+                    // a link shared as text, e.g. from a browser
+                    Regex("""(https?|rtsp|rtmp)://\S+""").find(text)?.value?.let(Uri::parse)
+                }
         else -> null
     }
 }

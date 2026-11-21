@@ -47,6 +47,9 @@ import com.arin.player.data.EngineMode
 import com.arin.player.data.LocalModel
 import com.arin.player.data.Settings
 import com.arin.player.engine.ModelManager
+import com.arin.player.update.UpdateState
+import com.arin.player.update.Updater
+import androidx.compose.material3.Button
 
 @Composable
 fun SettingsScreen(onClose: () -> Unit) {
@@ -64,6 +67,7 @@ fun SettingsScreen(onClose: () -> Unit) {
     var refresh by remember { mutableIntStateOf(0) } // re-check model files after delete
     val downloading by ModelManager.progress.collectAsState()
     val dlErrors by ModelManager.errors.collectAsState()
+    val updateState by Updater.state.collectAsState()
 
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
@@ -128,6 +132,25 @@ fun SettingsScreen(onClose: () -> Unit) {
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
                 }
                 Switch(checked = langTag, onCheckedChange = { langTag = it; s.showLanguageTag = it })
+            }
+            Section("App updates")
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.weight(1f)) {
+                    Text("Version ${Updater.currentName}")
+                    Text(
+                        when (updateState) {
+                            is UpdateState.Checking -> "Checking…"
+                            is UpdateState.Downloading -> "Downloading update…"
+                            is UpdateState.Available -> "A new version is available"
+                            else -> "Updates download and install inside the app"
+                        },
+                        fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                    )
+                }
+                Button(
+                    onClick = { Updater.check(silent = false) },
+                    enabled = updateState !is UpdateState.Checking && updateState !is UpdateState.Downloading,
+                ) { Text("Check for updates") }
             }
             Spacer(Modifier.height(32.dp))
         }

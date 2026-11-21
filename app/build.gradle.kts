@@ -13,8 +13,11 @@ android {
         applicationId = "com.arin.player"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        // Every CI run gets a higher versionCode, so the in-app updater knows what's newer.
+        val run = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
+        versionCode = run
+        versionName = "1.$run"
+        buildConfigField("String", "UPDATE_REPO", "\"poisaingti-spec/arin-player\"")
 
         ndk { abiFilters += listOf("arm64-v8a") }
 
@@ -33,11 +36,24 @@ android {
         }
     }
 
+    // One permanent key for every build: updates install over the old app, never needing an uninstall.
+    // The key comes from GitHub Secrets (KEYSTORE_BASE64 / KEYSTORE_PASSWORD); it is never in the repo.
+    signingConfigs {
+        create("arin") {
+            storeFile = rootProject.file("keystore/arin-player.jks")
+            storePassword = System.getenv("KEYSTORE_PASSWORD") ?: ""
+            keyAlias = "arinplayer"
+            keyPassword = System.getenv("KEYSTORE_PASSWORD") ?: ""
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            // Signed with the debug key so the CI APK installs directly.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("arin")
+        }
+        debug {
+            signingConfig = signingConfigs.getByName("arin")
         }
     }
 
@@ -47,7 +63,10 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
 
-    buildFeatures { compose = true }
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
 
     packaging {
         jniLibs {

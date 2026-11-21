@@ -136,9 +136,15 @@ class VlcAudioSource(
     /** Must be called on the main thread (libVLC event handler). */
     fun start() {
         wav.delete()
-        val fd = context.contentResolver.openFileDescriptor(uri, "r") ?: run { finished.complete(false); return }
-        pfd = fd
-        val media = Media(libVlc, fd.fileDescriptor)
+        val network = uri.scheme?.lowercase() in setOf("http", "https", "rtsp", "rtmp", "mms", "udp", "rtp")
+        val media = if (network) {
+            Media(libVlc, uri)
+        } else {
+            val fd = runCatching { context.contentResolver.openFileDescriptor(uri, "r") }.getOrNull()
+                ?: run { finished.complete(false); return }
+            pfd = fd
+            Media(libVlc, fd.fileDescriptor)
+        }
         media.addOption(
             ":sout=#transcode{vcodec=none,scodec=none,acodec=s16l,channels=1,samplerate=$SAMPLE_RATE}" +
                 ":std{access=file,mux=wav,dst=${wav.absolutePath}}"

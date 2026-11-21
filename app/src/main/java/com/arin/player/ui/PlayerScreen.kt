@@ -123,11 +123,16 @@ fun PlayerScreen(
     // ---- player setup / teardown
     DisposableEffect(uri) {
         player.attachViews(videoLayout, null, false, false)
-        val pfd = runCatching { ctx.contentResolver.openFileDescriptor(uri, "r") }.getOrNull()
-        if (pfd == null) {
+        val online = isNetworkUri(uri)
+        val pfd = if (online) null else runCatching { ctx.contentResolver.openFileDescriptor(uri, "r") }.getOrNull()
+        val media = when {
+            online -> Media(libVlc, uri).apply { addOption(":network-caching=3000") }
+            pfd != null -> Media(libVlc, pfd.fileDescriptor)
+            else -> null
+        }
+        if (media == null) {
             error = "Can't open this file"
         } else {
-            val media = Media(libVlc, pfd.fileDescriptor)
             media.setHWDecoderEnabled(true, false)
             player.media = media
             media.release()
@@ -315,8 +320,10 @@ private fun fmt(ms: Long): String {
     else String.format(Locale.US, "%d:%02d", s / 60, s % 60)
 }
 
+fun isNetworkUri(uri: Uri) = uri.scheme?.lowercase() in setOf("http", "https", "rtsp", "rtmp", "mms", "udp", "rtp")
+
 private fun displayName(ctx: android.content.Context, uri: Uri): String =
-    runCatching {
+    if (isNetworkUri(uri)) Uri.decode(uri.lastPathSegment ?: uri.host ?: "Online video") else runCatching {
         ctx.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
             if (c.moveToFirst()) c.getString(0) else null
         }
