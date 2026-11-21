@@ -54,7 +54,10 @@ Java_com_arin_player_engine_WhisperLib_freeContext(JNIEnv *, jobject, jlong ptr)
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_arin_player_engine_WhisperLib_translate(JNIEnv *env, jobject, jlong ptr,
                                                  jfloatArray samples, jint threads,
-                                                 jboolean translate) {
+                                                 jboolean translate, jstring jlang) {
+    const char *langC = env->GetStringUTFChars(jlang, nullptr);
+    std::string lang = langC ? langC : "auto";
+    env->ReleaseStringUTFChars(jlang, langC);
     auto *ctx = reinterpret_cast<whisper_context *>(ptr);
     std::string out;
     if (ctx) {
@@ -64,7 +67,7 @@ Java_com_arin_player_engine_WhisperLib_translate(JNIEnv *env, jobject, jlong ptr
         wp.print_timestamps = false;
         wp.print_special = false;
         wp.translate = translate;      // any language -> English
-        wp.language = "auto";          // detect the spoken language
+        wp.language = lang.c_str();    // "auto" = detect, or force e.g. "ko"
         wp.detect_language = false;    // (true would ONLY detect, no transcription)
         wp.n_threads = threads;
         wp.no_context = true;

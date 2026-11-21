@@ -78,6 +78,11 @@ import org.videolan.libvlc.Media
 import org.videolan.libvlc.MediaPlayer
 import org.videolan.libvlc.util.VLCVideoLayout
 import java.util.Locale
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.height
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.withStyle
@@ -196,6 +201,8 @@ private fun PlayerContent(
     val status by engine.status.collectAsState()
     val langs by engine.languages.collectAsState()
     val progress by engine.progress.collectAsState()
+    val coverage by engine.coverage.collectAsState()
+    val eta by engine.eta.collectAsState()
 
     val exporter = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/x-subrip")) { out ->
         out ?: return@rememberLauncherForActivityResult
@@ -350,6 +357,21 @@ private fun PlayerContent(
             Text(it, color = Color.White, modifier = Modifier.align(Alignment.Center).padding(24.dp))
         }
 
+        // While subtitles are still being made, keep a small progress badge visible.
+        if (!showControls && coverage.isNotEmpty() && progress < 1f) {
+            Row(
+                Modifier.align(Alignment.TopEnd).padding(12.dp)
+                    .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(12.dp))
+                    .padding(horizontal = 10.dp, vertical = 5.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                CircularProgressIndicator(progress = { progress }, color = Accent, strokeWidth = 2.dp,
+                    trackColor = Color.White.copy(alpha = 0.2f), modifier = Modifier.size(14.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Subtitles ${(progress * 100).toInt()}%", color = Color.White, fontSize = 12.sp)
+            }
+        }
+
         // ---- controls
         AnimatedVisibility(showControls, enter = fadeIn(), exit = fadeOut(), modifier = Modifier.fillMaxSize()) {
             Box(Modifier.fillMaxSize()) {
@@ -401,21 +423,43 @@ private fun PlayerContent(
                     Modifier.align(Alignment.BottomCenter).fillMaxWidth()
                         .background(Color.Black.copy(alpha = 0.55f)).padding(horizontal = 16.dp, vertical = 8.dp)
                 ) {
+                    // Subtitle progress for the whole video
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(status, color = Color.White.copy(alpha = 0.85f), fontSize = 12.sp, maxLines = 1,
-                            overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                        val pct = (progress * 100).toInt()
+                        Text(
+                            if (coverage.isNotEmpty() && pct >= 100) "✓ Subtitles ready for the whole video"
+                            else "Subtitles: $pct% of video" + (if (eta.isNotBlank()) " · $eta" else ""),
+                            color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f),
+                        )
                         if (langs.isNotEmpty()) {
                             Spacer(Modifier.width(8.dp))
-                            Text("Heard: " + langs.joinToString(" · ") + " → EN", color = Accent,
+                            Text(langs.joinToString(" · ") + " → EN", color = Accent,
                                 fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                         }
                     }
-                    LinearProgressIndicator(
-                        progress = { progress },
-                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
-                        color = Accent.copy(alpha = 0.6f),
-                        trackColor = Color.White.copy(alpha = 0.1f),
-                    )
+                    // Coverage bar: purple = parts of the video that already have subtitles,
+                    // white line = where you are.
+                    val posFrac = if (lenMs > 0) (posMs.toFloat() / lenMs).coerceIn(0f, 1f) else 0f
+                    Canvas(Modifier.fillMaxWidth().padding(top = 6.dp).height(8.dp)) {
+                        val n = coverage.size
+                        drawRoundRect(Color.White.copy(alpha = 0.15f), cornerRadius = CornerRadius(4f, 4f))
+                        if (n > 0) {
+                            val w = size.width / n
+                            var i = 0
+                            while (i < n) {
+                                if (coverage[i]) {
+                                    var j = i
+                                    while (j + 1 < n && coverage[j + 1]) j++
+                                    drawRect(Accent, topLeft = Offset(i * w, 0f), size = Size((j - i + 1) * w, size.height))
+                                    i = j + 1
+                                } else i++
+                            }
+                        }
+                        drawRect(Color.White, topLeft = Offset(posFrac * size.width - 2f, -4f), size = Size(4f, size.height + 8f))
+                    }
+                    Text(status, color = Color.White.copy(alpha = 0.6f), fontSize = 11.sp, maxLines = 1,
+                        overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 4.dp))
                     val sliderMax = lenMs.coerceAtLeast(1).toFloat()
                     Slider(
                         value = (dragging ?: posMs.toFloat()).coerceIn(0f, sliderMax),

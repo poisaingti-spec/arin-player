@@ -43,7 +43,8 @@ interface Transcriber {
     /** Stable id, used to pause a provider whose free limit has run out. */
     val id: String
     val label: String
-    suspend fun transcribe(pcm: FloatArray): ChunkResult
+    /** [forceLang] e.g. "KO": skip language detection (used once the video's main language is known). */
+    suspend fun transcribe(pcm: FloatArray, forceLang: String? = null): ChunkResult
     /** Last resort when no text translator can handle the language: audio -> English in one go. */
     suspend fun audioToEnglish(pcm: FloatArray): ChunkResult?
 }
@@ -100,17 +101,17 @@ class CloudTranscriber(private val provider: CloudProvider, private val apiKey: 
     override val id = "cloud-${provider.name}"
     override val label = provider.label.substringBefore(" (")
 
-    override suspend fun transcribe(pcm: FloatArray): ChunkResult {
-        val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+    override suspend fun transcribe(pcm: FloatArray, forceLang: String?): ChunkResult {
+        val b = MultipartBody.Builder().setType(MultipartBody.FORM)
             .addFormDataPart("model", provider.model)
             .addFormDataPart("response_format", "verbose_json")
             .addFormDataPart("timestamp_granularities[]", "word")
             .addFormDataPart("timestamp_granularities[]", "segment")
             .addFormDataPart("temperature", "0")
             .addFormDataPart("file", "chunk.wav", Wav.encode(pcm).toRequestBody("audio/wav".toMediaType()))
-            .build()
-        val o = JSONObject(postWithRetry(provider.transcribeUrl, apiKey, body))
-        val lang = langCode(o.optString("language"))
+        if (forceLang != null) b.addFormDataPart("language", forceLang.lowercase())
+        val o = JSONObject(postWithRetry(provider.transcribeUrl, apiKey, b.build()))
+        val lang = forceLang ?: langCode(o.optString("language"))
 
         // Segments Whisper itself flags as silence/noise ("Thank you." hallucinations): drop their words.
         val bad = mutableListOf<LongRange>()
@@ -167,12 +168,14 @@ class CloudflareTranscriber(private val accountId: String, private val token: St
     override val label = "Cloudflare"
     private val url get() = "https://api.cloudflare.com/client/v4/accounts/$accountId/ai/run/@cf/openai/whisper-large-v3-turbo"
 
-    private suspend fun run(pcm: FloatArray, task: String): JSONObject {
+    private suspend fun run(pcm: FloatArray, task: String, lang: String? = null): JSONObject {
         val audio = Base64.encodeToString(Wav.encode(pcm), Base64.NO_WRAP)
         val req = JSONObject()
             .put("audio", audio)
             .put("task", task)
             .put("condition_on_previous_text", false)
+            .put("vad_filter", true)
+        if (lang != null) req.put("language", lang.lowercase())
         val o = JSONObject(postWithRetry(url, token, req.toString().toRequestBody("application/json".toMediaType())))
         if (o.has("success") && !o.optBoolean("success")) {
             val msg = errorMessage(o.toString())
@@ -183,7 +186,8 @@ class CloudflareTranscriber(private val accountId: String, private val token: St
         return o.optJSONObject("result") ?: o
     }
 
-    override suspend fun transcribe(pcm: FloatArray): ChunkResult = parse(run(pcm, "transcribe"), wordsWanted = true)
+    override suspend fun transcribe(pcm: FloatArray, forceLang: String?): ChunkResult =
+        parse(run(pcm, "transcribe", forceLang), wordsWanted = true).let { if (forceLang != null) it.copy(lang = forceLang) else it }
 
     override suspend fun audioToEnglish(pcm: FloatArray): ChunkResult? =
         runCatching { parse(run(pcm, "translate"), wordsWanted = false) }.getOrNull()
@@ -231,7 +235,7 @@ class LocalTranscriber(private val modelFile: File, private val model: LocalMode
         }
     }
 
-    private suspend fun run(pcm: FloatArray, translate: Boolean): String = withContext(Dispatchers.Default) {
+    private suspend fun run(pcm: FloatArray, translate: Boolean, lang: String = "auto"): String = withContext(Dispatchers.Default) {
         lock.withLock {
             if (loadedPath != modelFile.path) {
                 if (ctx != 0L) WhisperLib.freeContext(ctx)
@@ -239,11 +243,13 @@ class LocalTranscriber(private val modelFile: File, private val model: LocalMode
                 loadedPath = if (ctx != 0L) modelFile.path else null
                 if (ctx == 0L) throw IllegalStateException("Couldn't load the offline model — try downloading it again")
             }
-            String(WhisperLib.translate(ctx, pcm, threads, translate), Charsets.UTF_8)
+            String(WhisperLib.translate(ctx, pcm, threads, translate, lang), Charsets.UTF_8)
         }
     }
 
-    override suspend fun transcribe(pcm: FloatArray): ChunkResult = parse(run(pcm, false), translated = false)
+    override suspend fun transcribe(pcm: FloatArray, forceLang: String?): ChunkResult =
+        parse(run(pcm, false, forceLang?.lowercase() ?: "auto"), translated = false)
+            .let { if (forceLang != null) it.copy(lang = forceLang) else it }
 
     /** Turbo was not trained to translate, so it can't do this step. */
     override suspend fun audioToEnglish(pcm: FloatArray): ChunkResult? =
@@ -297,7 +303,7 @@ object WhisperLib {
     init { System.loadLibrary("arinwhisper") }
     external fun initContext(path: String, aheadsPreset: Int): Long
     external fun freeContext(ptr: Long)
-    external fun translate(ptr: Long, samples: FloatArray, threads: Int, translate: Boolean): ByteArray
+    external fun translate(ptr: Long, samples: FloatArray, threads: Int, translate: Boolean, lang: String): ByteArray
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -36,8 +36,8 @@ class SubtitleCache(context: Context) {
     private val dir = File(context.filesDir, "subs").apply { mkdirs() }
 
     fun key(videoId: String, durationMs: Long): String {
-        // "v2": new word-timed pipeline, so older (looser) cached subtitles are redone.
-        val d = MessageDigest.getInstance("SHA-1").digest("v2|$videoId|$durationMs".toByteArray())
+        // "v3": 60 s pieces + language lock, so older (looser) cached subtitles are redone.
+        val d = MessageDigest.getInstance("SHA-1").digest("v3|$videoId|$durationMs".toByteArray())
         return d.joinToString("") { "%02x".format(it) }
     }
 

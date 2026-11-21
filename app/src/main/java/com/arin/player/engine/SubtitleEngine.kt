@@ -51,7 +51,8 @@ class SubtitleEngine(
     private val scope: CoroutineScope,
 ) {
     companion object {
-        const val CHUNK_MS = 30_000L
+        /** 60 s pieces: half the requests of 30 s, so the free cloud limit goes twice as far. */
+        const val CHUNK_MS = 60_000L
         /** How far a piece edge may move to find a quiet moment. */
         const val EDGE_SEARCH_MS = 2_500L
         /** Keep a line on screen a little after the voice stops (easier to read). */
@@ -69,6 +70,16 @@ class SubtitleEngine(
     val languages = MutableStateFlow<List<String>>(emptyList())
     /** Fraction of the whole video that has subtitles. */
     val progress = MutableStateFlow(0f)
+    /** Which parts of the video have subtitles (one entry per piece), for the coverage bar. */
+    val coverage = MutableStateFlow(BooleanArray(0))
+    /** e.g. "about 6 min left" while working. */
+    val eta = MutableStateFlow("")
+
+    /** Language found per piece, and how many lines it had (to spot misheard pieces). */
+    private val pieceLang = ConcurrentHashMap<Int, String>()
+    private val pieceLines = ConcurrentHashMap<Int, Int>()
+    private val redone = ConcurrentHashMap.newKeySet<Int>()
+    private val finishTimes = ArrayDeque<Long>()
 
     @Volatile private var positionMs = 0L
     private var durationMs = 0L
@@ -96,11 +107,16 @@ class SubtitleEngine(
         key = cache.key(source.cacheId, durationMs)
         cache.load(key)?.let { (d, c) ->
             d.filter { it < n }.forEach { done[it] = true }
+            // rebuild per-piece language info from the cached lines
+            c.groupBy { (it.startMs / CHUNK_MS).toInt() }.forEach { (i, cs) ->
+                pieceLang[i] = cs.groupingBy { it.lang }.eachCount().maxByOrNull { it.value }?.key ?: ""
+                pieceLines[i] = cs.size
+            }
             publish(c)
         }
         job = scope.launch(Dispatchers.Default) {
-            // 2 workers: while one waits on the network/model, the other decodes the next piece.
-            repeat(2) { launch { workerLoop() } }
+            // 3 workers: while some wait on the network/model, another decodes the next piece.
+            repeat(3) { launch { workerLoop() } }
         }
     }
 
@@ -180,7 +196,7 @@ class SubtitleEngine(
             if (e <= s) null
             else Cue(s, e, l.text, result.lang, l.words.map { w -> Word(start + w.startMs, start + w.endMs, w.text) })
         }
-        markDone(i, start, end, newCues)
+        markDone(i, start, end, newCues, result.lang)
     }
 
     /** Start of piece [k]: near k × 30 s, moved to the quietest 200 ms within ±2.5 s. */
@@ -269,17 +285,51 @@ class SubtitleEngine(
                 if (e is CloudException && e.code == 429) pausedUntil[t.id] = System.currentTimeMillis() + 15 * 60_000L
                 continue
             }
-            if (heard.lines.isEmpty() || heard.lang == "EN") return heard
-            status.value = "Translating ${fmt(start)}–${fmt(end)}"
-            val english = translateLines(heard.lines.map { it.text }, heard.lang)
-            if (english != null) {
-                return ChunkResult(heard.lang, heard.lines.mapIndexed { i, l -> Line(l.startMs, l.endMs, english[i]) })
+            var heard2 = heard
+            // Whisper sometimes "hears" a random language in music / quiet parts (Norwegian, Khmer…).
+            // Once the video's main language is clear, a piece with few lines in another language is
+            // re-heard as the main language.
+            val main = mainLanguage()
+            if (main != null && heard.lang != main && heard.lines.size < 6) {
+                runCatching { t.transcribe(pcm, main) }.getOrNull()?.let { heard2 = it }
             }
-            val direct = runCatching { t.audioToEnglish(pcm) }.getOrNull()
-            return if (direct != null && direct.lines.isNotEmpty()) direct.copy(lang = heard.lang)
-            else heard.copy(lines = heard.lines.map { it.copy(words = emptyList()) }) // original language
+            return finishTranslation(t, pcm, heard2, start, end)
         }
         throw last ?: IllegalStateException("No subtitle engine available")
+    }
+
+    private suspend fun finishTranslation(t: Transcriber, pcm: FloatArray, heard: ChunkResult, start: Long, end: Long): ChunkResult {
+        if (heard.lines.isEmpty() || heard.lang == "EN") return heard
+        status.value = "Translating ${fmt(start)}–${fmt(end)}"
+        val english = translateLines(heard.lines.map { it.text }, heard.lang)
+        if (english != null) {
+            return ChunkResult(heard.lang, heard.lines.mapIndexed { i, l -> Line(l.startMs, l.endMs, english[i]) })
+        }
+        val direct = runCatching { t.audioToEnglish(pcm) }.getOrNull()
+        return if (direct != null && direct.lines.isNotEmpty()) direct.copy(lang = heard.lang)
+        else heard.copy(lines = heard.lines.map { it.copy(words = emptyList()) }) // original language
+    }
+
+    /** The language most of the video is spoken in, once that's clear (≥ 4 pieces, ≥ 60 %). */
+    private fun mainLanguage(): String? {
+        val counts = HashMap<String, Int>()
+        pieceLang.forEach { (i, l) -> if (l.isNotBlank()) counts[l] = (counts[l] ?: 0) + (pieceLines[i] ?: 0) }
+        val total = counts.values.sum()
+        val top = counts.maxByOrNull { it.value } ?: return null
+        val pieces = pieceLang.count { (_, l) -> l == top.key }
+        return if (pieces >= 4 && total > 0 && top.value >= total * 0.6) top.key else null
+    }
+
+    /** Pieces done before the main language was known, heard as some other language with few lines: redo once. */
+    private fun requeueMisheard() {
+        val main = mainLanguage() ?: return
+        synchronized(this) {
+            pieceLang.forEach { (i, l) ->
+                if (l.isNotBlank() && l != main && (pieceLines[i] ?: 0) < 6 && i !in inFlight && redone.add(i) && i < done.size) {
+                    done[i] = false
+                }
+            }
+        }
     }
 
     private suspend fun translateLines(lines: List<String>, lang: String): List<String>? {
@@ -310,9 +360,35 @@ class SubtitleEngine(
         return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     }
 
-    private fun markDone(i: Int, start: Long, end: Long, newCues: List<Cue>) = synchronized(this) {
+    private fun markDone(i: Int, start: Long, end: Long, newCues: List<Cue>, lang: String = "") {
+        markDoneLocked(i, start, end, newCues, lang)
+        requeueMisheard()
+        updateEta()
+    }
+
+    private fun updateEta() {
+        val now = System.currentTimeMillis()
+        val remaining = synchronized(this) { done.count { !it } }
+        synchronized(finishTimes) {
+            finishTimes.addLast(now)
+            while (finishTimes.size > 12) finishTimes.removeFirst()
+            eta.value = when {
+                remaining == 0 -> ""
+                finishTimes.size < 3 -> "estimating time…"
+                else -> {
+                    val perPiece = (finishTimes.last() - finishTimes.first()) / (finishTimes.size - 1).toDouble()
+                    val mins = Math.ceil(perPiece * remaining / 60_000.0).toInt()
+                    if (mins <= 1) "about 1 min left" else "about $mins min left"
+                }
+            }
+        }
+    }
+
+    private fun markDoneLocked(i: Int, start: Long, end: Long, newCues: List<Cue>, lang: String) = synchronized(this) {
         done[i] = true
         inFlight -= i
+        if (lang.isNotBlank()) pieceLang[i] = lang
+        pieceLines[i] = newCues.size
         val merged = cues.value.filterNot { it.startMs >= start && it.startMs < end } + newCues
         publish(merged)
         runCatching { cache.save(key, done.indices.filter { done[it] }.toSet(), cues.value) }
@@ -321,8 +397,13 @@ class SubtitleEngine(
     private fun publish(list: List<Cue>) {
         val sorted = list.sortedBy { it.startMs }
         cues.value = sorted
-        languages.value = sorted.map { it.lang }.filter { it.isNotBlank() }.distinct()
+        // Only show languages that make up a real part of the video (hides one-off misdetections).
+        val counts = sorted.filter { it.lang.isNotBlank() }.groupingBy { it.lang }.eachCount()
+        val total = counts.values.sum().coerceAtLeast(1)
+        languages.value = counts.entries.filter { it.value >= 3 && it.value * 20 >= total }
+            .sortedByDescending { it.value }.map { it.key }.take(4)
         progress.value = if (done.isEmpty()) 0f else done.count { it }.toFloat() / done.size
+        coverage.value = done.copyOf()
     }
 
     private fun idleStatus() {
