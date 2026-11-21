@@ -38,13 +38,17 @@ interface AudioSource : Closeable {
  * Handles MP4, MKV, WebM, 3GP, TS, MOV with AAC/MP3/Opus/Vorbis/FLAC etc.
  * Can seek straight to any chunk, so subtitles follow the playback position.
  */
-class MediaCodecAudioSource(private val context: Context, private val uri: Uri) : AudioSource {
+class MediaCodecAudioSource(
+    private val context: Context,
+    private val uri: Uri,
+    private val headers: Map<String, String> = emptyMap(),
+) : AudioSource {
 
     override suspend fun read(startMs: Long, endMs: Long): FloatArray? = withContext(Dispatchers.IO) {
         val ex = MediaExtractor()
         var codec: MediaCodec? = null
         try {
-            ex.setDataSource(context, uri, null)
+            ex.setDataSource(context, uri, headers.ifEmpty { null })
             val track = (0 until ex.trackCount).firstOrNull {
                 ex.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true
             } ?: return@withContext null
@@ -126,6 +130,7 @@ class VlcAudioSource(
     private val context: Context,
     private val libVlc: LibVLC,
     private val uri: Uri,
+    private val headers: Map<String, String> = emptyMap(),
 ) : AudioSource {
     private val wav = File(context.cacheDir, "vlc_audio.wav")
     private val finished = CompletableDeferred<Boolean>()
@@ -138,7 +143,14 @@ class VlcAudioSource(
         wav.delete()
         val network = uri.scheme?.lowercase() in setOf("http", "https", "rtsp", "rtmp", "mms", "udp", "rtp")
         val media = if (network) {
-            Media(libVlc, uri)
+            Media(libVlc, uri).apply {
+                headers.forEach { (k, v) ->
+                    when (k.lowercase()) {
+                        "user-agent" -> addOption(":http-user-agent=$v")
+                        "referer" -> addOption(":http-referrer=$v")
+                    }
+                }
+            }
         } else {
             val fd = runCatching { context.contentResolver.openFileDescriptor(uri, "r") }.getOrNull()
                 ?: run { finished.complete(false); return }

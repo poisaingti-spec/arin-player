@@ -47,6 +47,9 @@ import com.arin.player.data.EngineMode
 import com.arin.player.data.LocalModel
 import com.arin.player.data.Settings
 import com.arin.player.engine.ModelManager
+import com.arin.player.online.OnlineResolver
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
 import com.arin.player.update.UpdateState
 import com.arin.player.update.Updater
 import androidx.compose.material3.Button
@@ -68,6 +71,8 @@ fun SettingsScreen(onClose: () -> Unit) {
     val downloading by ModelManager.progress.collectAsState()
     val dlErrors by ModelManager.errors.collectAsState()
     val updateState by Updater.state.collectAsState()
+    val engineStatus by OnlineResolver.engineStatus.collectAsState()
+    val scope = rememberCoroutineScope()
 
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
@@ -133,6 +138,21 @@ fun SettingsScreen(onClose: () -> Unit) {
                 }
                 Switch(checked = langTag, onCheckedChange = { langTag = it; s.showLanguageTag = it })
             }
+            Section("Website support (YouTube & 1000+ sites)")
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.weight(1f)) {
+                    Text("Video engine: yt-dlp ${remember(engineStatus) { OnlineResolver.version(ctx) }}")
+                    Text(
+                        engineStatus.ifBlank { "Updates itself daily. Update now if a site stops working." },
+                        fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                    )
+                }
+                TextButton(
+                    onClick = { scope.launch { runCatching { OnlineResolver.updateNow(ctx) } } },
+                    enabled = engineStatus != "Updating…",
+                ) { Text("Update now") }
+            }
+
             Section("App updates")
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                 Column(Modifier.weight(1f)) {

@@ -8,6 +8,7 @@ import com.arin.player.data.Cue
 import com.arin.player.data.EngineMode
 import com.arin.player.data.Settings
 import com.arin.player.data.SubtitleCache
+import com.arin.player.online.PlaybackSource
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -39,7 +40,7 @@ import kotlin.math.min
  */
 class SubtitleEngine(
     context: Context,
-    private val uri: Uri,
+    private val source: PlaybackSource,
     private val libVlc: LibVLC,
     private val scope: CoroutineScope,
 ) {
@@ -69,7 +70,9 @@ class SubtitleEngine(
     private var job: Job? = null
     private val wake = Channel<Unit>(Channel.CONFLATED)
 
-    private val primary: AudioSource = MediaCodecAudioSource(ctx, uri)
+    /** For YouTube-style sources the separate audio stream is all we need to listen to. */
+    private val audioUri: Uri = source.audioUri ?: source.uri
+    private val primary: AudioSource = MediaCodecAudioSource(ctx, audioUri, source.headers)
     private var vlc: VlcAudioSource? = null
     private val vlcLock = Mutex()
     @Volatile private var useVlc = false
@@ -79,7 +82,7 @@ class SubtitleEngine(
         durationMs = videoDurationMs
         val n = ((durationMs + CHUNK_MS - 1) / CHUNK_MS).toInt()
         done = BooleanArray(n)
-        key = cache.key(uri.toString(), durationMs)
+        key = cache.key(source.cacheId, durationMs)
         cache.load(key)?.let { (d, c) ->
             d.filter { it < n }.forEach { done[it] = true }
             publish(c)
@@ -181,7 +184,7 @@ class SubtitleEngine(
         val src = vlcLock.withLock {
             vlc ?: withContext(Dispatchers.Main) {
                 status.value = "Using VLC decoder for this format…"
-                VlcAudioSource(ctx, libVlc, uri).also { it.start() }
+                VlcAudioSource(ctx, libVlc, audioUri, source.headers).also { it.start() }
             }.also { vlc = it }
         }
         return src.read(startMs, endMs)

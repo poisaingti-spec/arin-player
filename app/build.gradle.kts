@@ -73,6 +73,9 @@ android {
             useLegacyPackaging = true
             pickFirsts += "**/libc++_shared.so"
         }
+        resources {
+            excludes += setOf("META-INF/DEPENDENCIES", "META-INF/LICENSE*", "META-INF/NOTICE*", "META-INF/*.kotlin_module")
+        }
     }
 }
 
@@ -91,4 +94,7 @@ dependencies {
     implementation("org.videolan.android:libvlc-all:3.6.0")
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // yt-dlp (+ Python + QuickJS) for YouTube and 1000+ other websites
+    implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
 }

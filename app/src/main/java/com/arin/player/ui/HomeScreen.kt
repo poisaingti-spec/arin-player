@@ -44,6 +44,7 @@ import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -54,9 +55,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import com.arin.player.data.EngineMode
 import com.arin.player.data.Settings
 import com.arin.player.engine.ModelManager
+import com.arin.player.online.isNetworkUri
 
 @Composable
-fun HomeScreen(onOpen: (Uri) -> Unit, onSettings: () -> Unit, settingsVersion: Int) {
+fun HomeScreen(onOpen: (Uri) -> Unit, onBrowse: (String) -> Unit, onSettings: () -> Unit, settingsVersion: Int) {
     val ctx = LocalContext.current
     val settings = remember(settingsVersion) { Settings(ctx) }
     val models = remember { ModelManager(ctx) }
@@ -123,6 +125,15 @@ fun HomeScreen(onOpen: (Uri) -> Unit, onSettings: () -> Unit, settingsVersion: I
             Button(onClick = { playUrl(url) }, modifier = Modifier.fillMaxWidth().height(52.dp)) {
                 Icon(Icons.Filled.Language, null); Spacer(Modifier.width(8.dp)); Text("Play link")
             }
+            Text(
+                "Works with YouTube, Facebook, Instagram, X, Vimeo and 1000+ sites, or any direct video link.",
+                fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                modifier = Modifier.padding(top = 6.dp),
+            )
+            TextButton(onClick = {
+                val u = url.trim().ifBlank { "https://www.google.com" }
+                onBrowse(if ("://" in u) u else "https://$u")
+            }) { Text("Open a website and pick the video from it") }
             if (recent.isNotEmpty()) {
                 Spacer(Modifier.height(12.dp))
                 Text("Recent links", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))

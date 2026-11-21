@@ -78,10 +78,86 @@ import org.videolan.libvlc.Media
 import org.videolan.libvlc.MediaPlayer
 import org.videolan.libvlc.util.VLCVideoLayout
 import java.util.Locale
+import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.TextButton
+import com.arin.player.online.OnlineResolver
+import com.arin.player.online.PlaybackSource
+import com.arin.player.online.PlayRequest
+import com.arin.player.online.isNetworkUri
+import kotlinx.coroutines.CancellationException
 
+/**
+ * Works out what to play first: a local file, a direct link, or (for web pages like YouTube)
+ * the real stream URLs via yt-dlp. Then shows the player.
+ */
 @Composable
 fun PlayerScreen(
-    uri: Uri,
+    request: PlayRequest,
+    settingsVersion: Int,
+    settingsOpen: Boolean,
+    onBack: () -> Unit,
+    onSettings: () -> Unit,
+    onFindInBrowser: (String) -> Unit,
+) {
+    val ctx = LocalContext.current
+    var source by remember(request) { mutableStateOf<PlaybackSource?>(null) }
+    var failure by remember(request) { mutableStateOf<String?>(null) }
+    val u = request.uri
+    val host = u.host?.removePrefix("www.")?.removePrefix("m.") ?: "the website"
+
+    LaunchedEffect(request) {
+        source = when {
+            !isNetworkUri(u) -> PlaybackSource(u, null, emptyMap(), displayName(ctx, u), u.toString())
+            request.direct || OnlineResolver.looksDirect(u) ->
+                PlaybackSource(u, null, request.headers, Uri.decode(u.lastPathSegment ?: host), u.toString())
+            else -> try {
+                val r = OnlineResolver.resolve(ctx, u.toString())
+                PlaybackSource(
+                    Uri.parse(r.videoUrl), r.audioUrl?.let(Uri::parse), r.headers,
+                    r.title ?: host, cacheId = u.buildUpon().clearQuery().build().toString() + "?" + (u.getQueryParameter("v") ?: ""),
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                failure = OnlineResolver.friendlyError(e)
+                null
+            }
+        }
+    }
+
+    val s = source
+    if (s != null) {
+        PlayerContent(s, settingsVersion, settingsOpen, onBack, onSettings)
+        return
+    }
+    Box(Modifier.fillMaxSize().background(Color.Black)) {
+        IconButton(onClick = onBack, modifier = Modifier.padding(8.dp)) {
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = Color.White)
+        }
+        Column(
+            Modifier.align(Alignment.Center).padding(32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            val f = failure
+            if (f == null) {
+                CircularProgressIndicator(color = Accent)
+                Text("Getting video from $host…", color = Color.White)
+                Text("The first link can take a few seconds", color = Color.White.copy(alpha = 0.6f), fontSize = 12.sp)
+            } else {
+                Text("Couldn't get the video from this link", color = Color.White, fontWeight = FontWeight.SemiBold)
+                Text(f, color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp, textAlign = TextAlign.Center)
+                Button(onClick = { onFindInBrowser(u.toString()) }) { Text("Find the video on the page") }
+                TextButton(onClick = onBack) { Text("Go back") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PlayerContent(
+    source: PlaybackSource,
     settingsVersion: Int,
     settingsOpen: Boolean,
     onBack: () -> Unit,
@@ -97,8 +173,8 @@ fun PlayerScreen(
     val libVlc = remember { LibVLC(ctx, arrayListOf("--audio-time-stretch", "--avcodec-skiploopfilter=0")) }
     val player = remember { MediaPlayer(libVlc) }
     val videoLayout = remember { VLCVideoLayout(ctx) }
-    val engine = remember { SubtitleEngine(ctx, uri, libVlc, scope) }
-    val title = remember(uri) { displayName(ctx, uri) }
+    val engine = remember { SubtitleEngine(ctx, source, libVlc, scope) }
+    val title = source.title
 
     var isPlaying by remember { mutableStateOf(false) }
     var posMs by remember { mutableLongStateOf(0L) }
@@ -121,12 +197,22 @@ fun PlayerScreen(
     }
 
     // ---- player setup / teardown
-    DisposableEffect(uri) {
+    DisposableEffect(source) {
         player.attachViews(videoLayout, null, false, false)
-        val online = isNetworkUri(uri)
-        val pfd = if (online) null else runCatching { ctx.contentResolver.openFileDescriptor(uri, "r") }.getOrNull()
+        val pfd = if (!source.isLocal) null
+        else runCatching { ctx.contentResolver.openFileDescriptor(source.uri, "r") }.getOrNull()
         val media = when {
-            online -> Media(libVlc, uri).apply { addOption(":network-caching=3000") }
+            !source.isLocal -> Media(libVlc, source.uri).apply {
+                addOption(":network-caching=3000")
+                // HD streams (YouTube etc.) come as separate video + audio
+                source.audioUri?.let { addOption(":input-slave=$it") }
+                source.headers.forEach { (k, v) ->
+                    when (k.lowercase()) {
+                        "user-agent" -> addOption(":http-user-agent=$v")
+                        "referer" -> addOption(":http-referrer=$v")
+                    }
+                }
+            }
             pfd != null -> Media(libVlc, pfd.fileDescriptor)
             else -> null
         }
@@ -320,10 +406,8 @@ private fun fmt(ms: Long): String {
     else String.format(Locale.US, "%d:%02d", s / 60, s % 60)
 }
 
-fun isNetworkUri(uri: Uri) = uri.scheme?.lowercase() in setOf("http", "https", "rtsp", "rtmp", "mms", "udp", "rtp")
-
 private fun displayName(ctx: android.content.Context, uri: Uri): String =
-    if (isNetworkUri(uri)) Uri.decode(uri.lastPathSegment ?: uri.host ?: "Online video") else runCatching {
+    runCatching {
         ctx.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
             if (c.moveToFirst()) c.getString(0) else null
         }
