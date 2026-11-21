@@ -85,6 +85,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.TextButton
 import com.arin.player.online.OnlineResolver
+import com.arin.player.online.StreamBooster
 import com.arin.player.online.PlaybackSource
 import com.arin.player.online.PlayRequest
 import com.arin.player.online.isNetworkUri
@@ -131,7 +132,9 @@ fun PlayerScreen(
 
     val s = source
     if (s != null) {
-        PlayerContent(s, settingsVersion, settingsOpen, onBack, onSettings)
+        // Online videos go through the booster: many parallel connections = full internet speed.
+        val boosted = remember(s) { StreamBooster.boost(s) }
+        PlayerContent(boosted, settingsVersion, settingsOpen, onBack, onSettings)
         return
     }
     Box(Modifier.fillMaxSize().background(Color.Black)) {
@@ -206,7 +209,9 @@ private fun PlayerContent(
         else runCatching { ctx.contentResolver.openFileDescriptor(source.uri, "r") }.getOrNull()
         val media = when {
             !source.isLocal -> Media(libVlc, source.uri).apply {
-                addOption(":network-caching=3000")
+                // Booster serves from the phone itself, so a short buffer is enough -> faster start.
+                addOption(if (source.uri.host == "127.0.0.1") ":network-caching=1200" else ":network-caching=2500")
+                addOption(":http-reconnect")
                 // HD streams (YouTube etc.) come as separate video + audio
                 source.audioUri?.let { addOption(":input-slave=$it") }
                 source.headers.forEach { (k, v) ->
@@ -233,7 +238,7 @@ private fun PlayerContent(
                 MediaPlayer.Event.Paused, MediaPlayer.Event.Stopped -> isPlaying = false
                 MediaPlayer.Event.EndReached -> { isPlaying = false; showControls = true }
                 MediaPlayer.Event.LengthChanged -> if (e.lengthChanged > 0) {
-                    lenMs = e.lengthChanged; engine.start(e.lengthChanged)
+                    lenMs = e.lengthChanged
                 }
                 MediaPlayer.Event.EncounteredError -> error = "This video couldn't be played"
             }
@@ -274,8 +279,18 @@ private fun PlayerContent(
         while (true) {
             val t = player.time
             if (t >= 0) { posMs = t; engine.onPosition(t) }
-            if (lenMs <= 0 && player.length > 0) { lenMs = player.length; engine.start(lenMs) }
+            if (lenMs <= 0 && player.length > 0) lenMs = player.length
             delay(50)
+        }
+    }
+
+    // ---- start subtitles once the video is actually playing, so they don't slow its start
+    var everPlayed by remember { mutableStateOf(false) }
+    LaunchedEffect(isPlaying) { if (isPlaying) everPlayed = true }
+    LaunchedEffect(everPlayed, lenMs) {
+        if (everPlayed && lenMs > 0) {
+            if (!source.isLocal) delay(4_000) // let the video fill its buffer first
+            engine.start(lenMs)
         }
     }
 

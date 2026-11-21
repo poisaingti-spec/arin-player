@@ -1,12 +1,19 @@
 package com.arin.player.engine
 
+import android.util.Base64
 import com.arin.player.data.CloudProvider
 import com.arin.player.data.LocalModel
 import com.arin.player.data.Word
+import com.google.mlkit.common.model.DownloadConditions
+import com.google.mlkit.nl.translate.TranslateLanguage
+import com.google.mlkit.nl.translate.Translation
+import com.google.mlkit.nl.translate.Translator
+import com.google.mlkit.nl.translate.TranslatorOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
@@ -20,64 +27,89 @@ import java.io.File
 import java.util.concurrent.TimeUnit
 
 /**
- * One subtitle line, times relative to the start of the chunk. [startMs]/[endMs] are exactly when
+ * One subtitle line, times relative to the start of the piece. [startMs]/[endMs] are exactly when
  * the line is spoken. [words] carries per-word timing when the text is the spoken words themselves.
  */
 data class Line(val startMs: Long, val endMs: Long, val text: String, val words: List<Word> = emptyList())
 
-/** [lang] = detected spoken language as an upper-case code ("JA", "HI"…). Lines are in English. */
+/** [lang] = detected spoken language as an upper-case code ("JA", "HI"…). */
 data class ChunkResult(val lang: String, val lines: List<Line>)
 
+/**
+ * Speech recogniser. Step 1 of 2: [transcribe] writes down what is said, in the language spoken,
+ * with a time for every word. Step 2 (translation to English) is done separately by [LineTranslators].
+ */
 interface Transcriber {
+    /** Stable id, used to pause a provider whose free limit has run out. */
+    val id: String
     val label: String
-    /** Detects the spoken language in [pcm] (16 kHz mono) and returns timed English subtitle lines. */
-    suspend fun translate(pcm: FloatArray): ChunkResult
+    suspend fun transcribe(pcm: FloatArray): ChunkResult
+    /** Last resort when no text translator can handle the language: audio -> English in one go. */
+    suspend fun audioToEnglish(pcm: FloatArray): ChunkResult?
 }
 
 class CloudException(val code: Int, msg: String) : RuntimeException(msg)
 
-/**
- * Cloud pipeline for tight sync:
- *  1. Whisper large-v3 *transcribes* the audio in its own language with a timestamp for every word.
- *  2. Words are grouped into short lines at pauses and sentence ends -> each line has exact start/end.
- *  3. Non-English lines are translated to English by a text model, one-to-one, keeping those times.
- *     English audio keeps its words, so they light up word by word.
- * If step 3 fails, falls back to Whisper's own audio->English translation.
- */
-class CloudTranscriber(private val provider: CloudProvider, private val apiKey: String) : Transcriber {
-    override val label = "cloud"
+val http: OkHttpClient = OkHttpClient.Builder()
+    .connectTimeout(20, TimeUnit.SECONDS)
+    .callTimeout(180, TimeUnit.SECONDS)
+    .build()
 
-    companion object {
-        val http: OkHttpClient = OkHttpClient.Builder()
-            .connectTimeout(20, TimeUnit.SECONDS)
-            .callTimeout(180, TimeUnit.SECONDS)
-            .build()
-    }
-
-    override suspend fun translate(pcm: FloatArray): ChunkResult = withContext(Dispatchers.IO) {
-        val wav = Wav.encode(pcm)
-        val t = transcribe(wav)
-        if (t.lines.isEmpty() || t.lang == "EN") return@withContext t
-        val english = runCatching { translateLines(t.lines.map { it.text }, t.lang) }.getOrNull()
-        if (english != null) {
-            ChunkResult(t.lang, t.lines.mapIndexed { i, l -> Line(l.startMs, l.endMs, english[i]) }
-                .filter { it.text.isNotBlank() })
-        } else {
-            audioTranslate(wav, t.lang)
+/** POST with retries on short rate limits / server errors. */
+suspend fun postWithRetry(url: String, auth: String, body: RequestBody): String = withContext(Dispatchers.IO) {
+    var attempt = 0
+    while (true) {
+        val req = Request.Builder().url(url).header("Authorization", "Bearer $auth").post(body).build()
+        var retryAfterMs = -1L
+        http.newCall(req).execute().use { resp ->
+            val txt = resp.body?.string().orEmpty()
+            when {
+                resp.isSuccessful -> return@withContext txt
+                resp.code == 401 || resp.code == 403 -> throw CloudException(resp.code, "API key rejected — check it in Settings")
+                (resp.code == 429 || resp.code >= 500) && attempt < 3 -> {
+                    val ra = resp.header("retry-after")?.toDoubleOrNull()?.times(1000)?.toLong() ?: (2_000L shl attempt)
+                    // A long wait means the hourly/daily free limit is used up: let the caller switch provider.
+                    if (resp.code == 429 && ra > 60_000) throw CloudException(429, "Free limit reached")
+                    retryAfterMs = ra
+                }
+                resp.code == 429 -> throw CloudException(429, "Free limit reached")
+                else -> throw CloudException(resp.code, "Cloud error ${resp.code}: ${errorMessage(txt)}")
+            }
         }
+        attempt++
+        delay(retryAfterMs.coerceIn(1_000, 60_000))
     }
+    @Suppress("UNREACHABLE_CODE") error("unreachable")
+}
 
-    /** Step 1+2: same-language transcript with word timestamps, grouped into lines. */
-    private suspend fun transcribe(wav: ByteArray): ChunkResult {
+private fun errorMessage(txt: String): String = runCatching {
+    val o = JSONObject(txt)
+    o.optJSONObject("error")?.optString("message")
+        ?: o.optJSONArray("errors")?.optJSONObject(0)?.optString("message")
+        ?: txt.take(120)
+}.getOrDefault(txt.take(120))
+
+private fun isSilentSeg(s: JSONObject) =
+    s.optDouble("no_speech_prob", 0.0) > 0.6 && s.optDouble("avg_logprob", 0.0) < -1.0
+
+// ---------------------------------------------------------------------------------------------
+// Groq / OpenAI
+// ---------------------------------------------------------------------------------------------
+
+class CloudTranscriber(private val provider: CloudProvider, private val apiKey: String) : Transcriber {
+    override val id = "cloud-${provider.name}"
+    override val label = provider.label.substringBefore(" (")
+
+    override suspend fun transcribe(pcm: FloatArray): ChunkResult {
         val body = MultipartBody.Builder().setType(MultipartBody.FORM)
             .addFormDataPart("model", provider.model)
             .addFormDataPart("response_format", "verbose_json")
             .addFormDataPart("timestamp_granularities[]", "word")
             .addFormDataPart("timestamp_granularities[]", "segment")
             .addFormDataPart("temperature", "0")
-            .addFormDataPart("file", "chunk.wav", wav.toRequestBody("audio/wav".toMediaType()))
+            .addFormDataPart("file", "chunk.wav", Wav.encode(pcm).toRequestBody("audio/wav".toMediaType()))
             .build()
-        val o = JSONObject(post(provider.transcribeUrl, body))
+        val o = JSONObject(postWithRetry(provider.transcribeUrl, apiKey, body))
         val lang = langCode(o.optString("language"))
 
         // Segments Whisper itself flags as silence/noise ("Thank you." hallucinations): drop their words.
@@ -88,8 +120,7 @@ class CloudTranscriber(private val provider: CloudProvider, private val apiKey: 
                 val s = arr.getJSONObject(i)
                 val st = (s.getDouble("start") * 1000).toLong()
                 val en = (s.getDouble("end") * 1000).toLong()
-                val silent = s.optDouble("no_speech_prob", 0.0) > 0.6 && s.optDouble("avg_logprob", 0.0) < -1.0
-                if (silent) bad += st..en
+                if (isSilentSeg(s)) bad += st..en
                 else s.optString("text").trim().takeIf { it.isNotBlank() }?.let { segs += Line(st, en, it) }
             }
         }
@@ -103,84 +134,89 @@ class CloudTranscriber(private val provider: CloudProvider, private val apiKey: 
                 if (text.isNotEmpty() && bad.none { st in it }) words += Word(st, en, text)
             }
         }
-        val lines = if (words.isNotEmpty()) LineBuilder.fromWords(words, lang) else segs
-        return ChunkResult(lang, if (lang == "EN") lines else lines.map { it.copy(words = emptyList()) })
+        return ChunkResult(lang, if (words.isNotEmpty()) LineBuilder.fromWords(words, lang) else segs)
     }
 
-    /** Step 3: translate N lines -> exactly N English lines. Returns null if the model doesn't comply. */
-    private suspend fun translateLines(lines: List<String>, lang: String): List<String>? {
-        val sys = "You translate video subtitles into natural, fluent, everyday English. " +
-            "The input is JSON {\"lines\": [...]} spoken mostly in language code $lang (lines may mix languages). " +
-            "Reply with ONLY JSON {\"en\": [...]} containing exactly ${lines.size} strings: the English for each " +
-            "input line, same order, one-to-one. Never merge, split, skip or add lines. Keep lines short. " +
-            "Lines already in English stay as they are. Use the neighbouring lines as context."
-        val req = JSONObject()
-            .put("model", provider.chatModel)
-            .put("temperature", 0.2)
-            .put("response_format", JSONObject().put("type", "json_object"))
-            .put("messages", JSONArray()
-                .put(JSONObject().put("role", "system").put("content", sys))
-                .put(JSONObject().put("role", "user").put("content", JSONObject().put("lines", JSONArray(lines)).toString())))
-        if (provider == CloudProvider.GROQ) req.put("reasoning_effort", "low")
-        val resp = JSONObject(post(provider.chatUrl, req.toString().toRequestBody("application/json".toMediaType())))
-        val content = resp.getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content")
-        val json = content.substring(content.indexOf('{'), content.lastIndexOf('}') + 1)
-        val arr = JSONObject(json).getJSONArray("en")
-        if (arr.length() != lines.size) return null
-        return (0 until arr.length()).map { arr.optString(it).trim() }
-    }
-
-    /** Fallback: Whisper's own audio -> English (segment-level timing). */
-    private suspend fun audioTranslate(wav: ByteArray, lang: String): ChunkResult {
+    override suspend fun audioToEnglish(pcm: FloatArray): ChunkResult {
         val body = MultipartBody.Builder().setType(MultipartBody.FORM)
             .addFormDataPart("model", provider.model)
             .addFormDataPart("response_format", "verbose_json")
             .addFormDataPart("temperature", "0")
-            .addFormDataPart("file", "chunk.wav", wav.toRequestBody("audio/wav".toMediaType()))
+            .addFormDataPart("file", "chunk.wav", Wav.encode(pcm).toRequestBody("audio/wav".toMediaType()))
             .build()
-        val o = JSONObject(post(provider.translateUrl, body))
+        val o = JSONObject(postWithRetry(provider.translateUrl, apiKey, body))
         val lines = mutableListOf<Line>()
         o.optJSONArray("segments")?.let { segs ->
             for (i in 0 until segs.length()) {
                 val s = segs.getJSONObject(i)
                 val text = s.optString("text").trim()
-                val silent = s.optDouble("no_speech_prob", 0.0) > 0.6 && s.optDouble("avg_logprob", 0.0) < -1.0
-                if (text.isBlank() || silent) continue
+                if (text.isBlank() || isSilentSeg(s)) continue
                 lines += Line((s.getDouble("start") * 1000).toLong(), (s.getDouble("end") * 1000).toLong(), text)
             }
         }
-        return ChunkResult(langCode(o.optString("language")).ifBlank { lang }, lines)
+        return ChunkResult(langCode(o.optString("language")), lines)
     }
-
-    /** POST with retries on rate limits / server errors. */
-    private suspend fun post(url: String, body: RequestBody): String {
-        var attempt = 0
-        while (true) {
-            val req = Request.Builder().url(url).header("Authorization", "Bearer $apiKey").post(body).build()
-            var retryAfterMs = -1L
-            http.newCall(req).execute().use { resp ->
-                val txt = resp.body?.string().orEmpty()
-                when {
-                    resp.isSuccessful -> return txt
-                    resp.code == 401 -> throw CloudException(401, "API key rejected — check it in Settings")
-                    (resp.code == 429 || resp.code >= 500) && attempt < 4 ->
-                        retryAfterMs = resp.header("retry-after")?.toDoubleOrNull()?.times(1000)?.toLong()
-                            ?: (2_000L shl attempt)
-                    resp.code == 429 -> throw CloudException(429, "Cloud limit reached: ${errorMessage(txt)}")
-                    else -> throw CloudException(resp.code, "Cloud error ${resp.code}: ${errorMessage(txt)}")
-                }
-            }
-            attempt++
-            delay(retryAfterMs.coerceIn(1_000, 60_000))
-        }
-    }
-
-    private fun errorMessage(txt: String) =
-        runCatching { JSONObject(txt).getJSONObject("error").getString("message") }.getOrDefault(txt.take(120))
 }
 
-/** whisper.cpp running on the phone's CPU, with DTW word timing. */
+// ---------------------------------------------------------------------------------------------
+// Cloudflare Workers AI (free daily allowance) — whisper-large-v3-turbo with word timings
+// ---------------------------------------------------------------------------------------------
+
+class CloudflareTranscriber(private val accountId: String, private val token: String) : Transcriber {
+    override val id = "cloud-CF"
+    override val label = "Cloudflare"
+    private val url get() = "https://api.cloudflare.com/client/v4/accounts/$accountId/ai/run/@cf/openai/whisper-large-v3-turbo"
+
+    private suspend fun run(pcm: FloatArray, task: String): JSONObject {
+        val audio = Base64.encodeToString(Wav.encode(pcm), Base64.NO_WRAP)
+        val req = JSONObject()
+            .put("audio", audio)
+            .put("task", task)
+            .put("condition_on_previous_text", false)
+        val o = JSONObject(postWithRetry(url, token, req.toString().toRequestBody("application/json".toMediaType())))
+        if (o.has("success") && !o.optBoolean("success")) {
+            val msg = errorMessage(o.toString())
+            // Daily free allowance used up
+            if ("neuron" in msg.lowercase() || "limit" in msg.lowercase()) throw CloudException(429, "Free limit reached")
+            throw CloudException(500, "Cloudflare: $msg")
+        }
+        return o.optJSONObject("result") ?: o
+    }
+
+    override suspend fun transcribe(pcm: FloatArray): ChunkResult = parse(run(pcm, "transcribe"), wordsWanted = true)
+
+    override suspend fun audioToEnglish(pcm: FloatArray): ChunkResult? =
+        runCatching { parse(run(pcm, "translate"), wordsWanted = false) }.getOrNull()
+
+    private fun parse(r: JSONObject, wordsWanted: Boolean): ChunkResult {
+        val lang = langCode(r.optJSONObject("transcription_info")?.optString("language").orEmpty())
+        val words = mutableListOf<Word>()
+        val segs = mutableListOf<Line>()
+        r.optJSONArray("segments")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val s = arr.getJSONObject(i)
+                if (isSilentSeg(s)) continue
+                val text = s.optString("text").trim()
+                if (text.isNotBlank()) segs += Line((s.getDouble("start") * 1000).toLong(), (s.getDouble("end") * 1000).toLong(), text)
+                s.optJSONArray("words")?.let { ws ->
+                    for (j in 0 until ws.length()) {
+                        val w = ws.getJSONObject(j)
+                        val t = w.optString("word").trim()
+                        if (t.isNotEmpty()) words += Word((w.getDouble("start") * 1000).toLong(), (w.getDouble("end") * 1000).toLong(), t)
+                    }
+                }
+            }
+        }
+        return ChunkResult(lang, if (wordsWanted && words.isNotEmpty()) LineBuilder.fromWords(words, lang) else segs)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Offline: whisper.cpp on the phone, with DTW word timing
+// ---------------------------------------------------------------------------------------------
+
 class LocalTranscriber(private val modelFile: File, private val model: LocalModel) : Transcriber {
+    override val id = "local"
     override val label = "offline"
 
     companion object {
@@ -195,7 +231,7 @@ class LocalTranscriber(private val modelFile: File, private val model: LocalMode
         }
     }
 
-    override suspend fun translate(pcm: FloatArray): ChunkResult = withContext(Dispatchers.Default) {
+    private suspend fun run(pcm: FloatArray, translate: Boolean): String = withContext(Dispatchers.Default) {
         lock.withLock {
             if (loadedPath != modelFile.path) {
                 if (ctx != 0L) WhisperLib.freeContext(ctx)
@@ -203,17 +239,24 @@ class LocalTranscriber(private val modelFile: File, private val model: LocalMode
                 loadedPath = if (ctx != 0L) modelFile.path else null
                 if (ctx == 0L) throw IllegalStateException("Couldn't load the offline model — try downloading it again")
             }
-            parse(String(WhisperLib.translate(ctx, pcm, threads, true), Charsets.UTF_8))
+            String(WhisperLib.translate(ctx, pcm, threads, translate), Charsets.UTF_8)
         }
     }
+
+    override suspend fun transcribe(pcm: FloatArray): ChunkResult = parse(run(pcm, false), translated = false)
+
+    /** Turbo was not trained to translate, so it can't do this step. */
+    override suspend fun audioToEnglish(pcm: FloatArray): ChunkResult? =
+        if (model == LocalModel.LARGE_TURBO) null else parse(run(pcm, true), translated = true)
 
     private class Seg(val t0: Long, val t1: Long, val text: String, val noSpeech: Float) {
         val tokens = mutableListOf<Pair<Long, String>>()
     }
 
-    private fun parse(raw: String): ChunkResult {
+    private fun parse(raw: String, translated: Boolean): ChunkResult {
         val rows = raw.split('\n')
         val lang = langCode(rows.firstOrNull().orEmpty())
+        val textLang = if (translated) "EN" else lang
         val segs = mutableListOf<Seg>()
         for (r in rows.drop(1)) {
             val p = r.split('\t')
@@ -222,10 +265,12 @@ class LocalTranscriber(private val modelFile: File, private val model: LocalMode
                 "T" -> if (p.size >= 3) segs.lastOrNull()?.tokens?.add(p[1].toLong() to p.subList(2, p.size).joinToString("\t"))
             }
         }
+        val noSpace = LineBuilder.isNoSpace(textLang)
         val lines = mutableListOf<Line>()
         for (s in segs) {
             if (s.text.isBlank() || s.noSpeech > 0.8f || (s.text.startsWith("[") && s.text.endsWith("]"))) continue
-            // Tokens -> words: a token starting with a space begins a new word.
+            // Tokens -> words. Spaced languages: a token starting with a space begins a new word.
+            // Japanese/Chinese/Thai: every token is its own unit.
             val words = mutableListOf<Word>()
             var curText = StringBuilder()
             var curStart = -1L
@@ -236,20 +281,15 @@ class LocalTranscriber(private val modelFile: File, private val model: LocalMode
             }
             for ((t, txt) in s.tokens) {
                 val tt = t.coerceIn(s.t0, s.t1)
-                if (txt.startsWith(" ") && curText.isNotEmpty()) flush(tt)
+                if ((noSpace || txt.startsWith(" ")) && curText.isNotEmpty()) flush(tt)
                 if (curStart < 0) curStart = tt
                 curText.append(txt)
             }
             flush(s.t1)
             val usable = words.size >= 2 && words.zipWithNext().all { (a, b) -> b.startMs >= a.startMs }
-            if (usable) {
-                val built = LineBuilder.fromWords(words, "EN") // output text is English (translate mode)
-                lines += if (lang == "EN") built else built.map { it.copy(words = emptyList()) }
-            } else {
-                lines += Line(s.t0, s.t1, s.text)
-            }
+            lines += if (usable) LineBuilder.fromWords(words, textLang) else listOf(Line(s.t0, s.t1, s.text))
         }
-        return ChunkResult(lang, lines)
+        return ChunkResult(lang, if (translated) lines.map { it.copy(words = emptyList()) } else lines)
     }
 }
 
@@ -260,15 +300,78 @@ object WhisperLib {
     external fun translate(ptr: Long, samples: FloatArray, threads: Int, translate: Boolean): ByteArray
 }
 
+// ---------------------------------------------------------------------------------------------
+// Step 2: text translation of timed lines -> English (one English line per spoken line)
+// ---------------------------------------------------------------------------------------------
+
+interface LineTranslator {
+    /** Exactly one English string per input line, or null if this translator can't do it. */
+    suspend fun toEnglish(lines: List<String>, lang: String): List<String>?
+}
+
+/** Groq (gpt-oss-120b) / OpenAI text model: best quality, uses context between lines. */
+class ChatTranslator(private val provider: CloudProvider, private val apiKey: String) : LineTranslator {
+    override suspend fun toEnglish(lines: List<String>, lang: String): List<String>? {
+        val sys = "You translate video subtitles into natural, fluent, everyday English. " +
+            "The input is JSON {\"lines\": [...]} spoken mostly in language code $lang (lines may mix languages). " +
+            "Reply with ONLY JSON {\"en\": [...]} containing exactly ${lines.size} strings: the English for each " +
+            "input line, same order, one-to-one. Never merge, split, skip or add lines. Keep lines short. " +
+            "Lines already in English stay as they are. Use the neighbouring lines as context."
+        val req = JSONObject()
+            .put("model", provider.chatModel)
+            .put("temperature", 0.2)
+            .put("response_format", JSONObject().put("type", "json_object"))
+            .put("messages", JSONArray()
+                .put(JSONObject().put("role", "system").put("content", sys))
+                .put(JSONObject().put("role", "user").put("content", JSONObject().put("lines", JSONArray(lines)).toString())))
+        if (provider == CloudProvider.GROQ) req.put("reasoning_effort", "low")
+        val resp = JSONObject(postWithRetry(provider.chatUrl, apiKey, req.toString().toRequestBody("application/json".toMediaType())))
+        val content = resp.getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content")
+        val json = content.substring(content.indexOf('{'), content.lastIndexOf('}') + 1)
+        val arr = JSONObject(json).getJSONArray("en")
+        if (arr.length() != lines.size) return null
+        return (0 until arr.length()).map { arr.optString(it).trim() }
+    }
+}
+
+/**
+ * Google ML Kit on-device translation: free, unlimited, works offline once the language pack
+ * (~30 MB, downloaded automatically the first time a language is heard) is on the phone.
+ */
+object MlKitTranslator : LineTranslator {
+    private val clients = mutableMapOf<String, Translator>()
+    private val lock = Mutex()
+
+    fun supports(lang: String) = TranslateLanguage.fromLanguageTag(lang.lowercase()) != null
+
+    override suspend fun toEnglish(lines: List<String>, lang: String): List<String>? {
+        val src = TranslateLanguage.fromLanguageTag(lang.lowercase()) ?: return null
+        if (src == TranslateLanguage.ENGLISH) return lines
+        val t = lock.withLock {
+            clients.getOrPut(src) {
+                Translation.getClient(
+                    TranslatorOptions.Builder().setSourceLanguage(src).setTargetLanguage(TranslateLanguage.ENGLISH).build()
+                )
+            }
+        }
+        t.downloadModelIfNeeded(DownloadConditions.Builder().build()).await()
+        return lines.map { t.translate(it).await() }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+
 /** Groups timed words into readable subtitle lines, breaking at pauses and sentence ends. */
 object LineBuilder {
     private val NO_SPACE_LANGS = setOf("JA", "ZH", "YUE", "TH", "LO", "MY", "KM", "BO")
-    private val SENTENCE_END = Regex("""[.?!。？！…]["'”’)]*$""")
+    private val SENTENCE_END = Regex("""[.?!。？！…।]["'”’)」』]*$""")
     private const val PAUSE_MS = 600
     private const val MAX_LINE_MS = 5_500
 
+    fun isNoSpace(lang: String) = lang in NO_SPACE_LANGS
+
     fun fromWords(words: List<Word>, lang: String): List<Line> {
-        val noSpace = lang in NO_SPACE_LANGS
+        val noSpace = isNoSpace(lang)
         val maxChars = if (noSpace) 22 else 64
         val out = mutableListOf<Line>()
         var cur = mutableListOf<Word>()
@@ -298,10 +401,10 @@ private val LANG_NAMES = mapOf(
     "telugu" to "TE", "urdu" to "UR", "marathi" to "MR", "gujarati" to "GU", "kannada" to "KN",
     "malayalam" to "ML", "punjabi" to "PA", "nepali" to "NE", "indonesian" to "ID", "thai" to "TH",
     "vietnamese" to "VI", "turkish" to "TR", "persian" to "FA", "dutch" to "NL", "polish" to "PL",
-    "ukrainian" to "UK", "tagalog" to "TL", "malay" to "MS", "cantonese" to "YUE",
+    "ukrainian" to "UK", "tagalog" to "TL", "malay" to "MS", "cantonese" to "YUE", "hebrew" to "HE",
 )
 
-/** Groq/OpenAI return names ("japanese"), whisper.cpp returns codes ("ja"). Normalise to "JA". */
+/** Groq/OpenAI return names ("japanese"), whisper.cpp/Cloudflare return codes ("ja"). Normalise to "JA". */
 fun langCode(s: String): String {
     val t = s.trim().lowercase()
     if (t.isEmpty()) return ""

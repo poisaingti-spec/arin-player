@@ -65,6 +65,8 @@ fun SettingsScreen(onClose: () -> Unit) {
     var provider by remember { mutableStateOf(s.provider) }
     var key by remember(provider) { mutableStateOf(s.apiKey(provider)) }
     var localModel by remember { mutableStateOf(s.localModel) }
+    var cfAccount by remember { mutableStateOf(s.cfAccountId) }
+    var cfToken by remember { mutableStateOf(s.cfToken) }
     var subSize by remember { mutableFloatStateOf(s.subtitleSizeSp) }
     var langTag by remember { mutableStateOf(s.showLanguageTag) }
     var refresh by remember { mutableIntStateOf(0) } // re-check model files after delete
@@ -99,12 +101,39 @@ fun SettingsScreen(onClose: () -> Unit) {
                     visualTransformation = PasswordVisualTransformation(),
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                 )
-                Text("Get one at ${provider.keyHint}", fontSize = 12.sp,
+                Text("Get one free at ${provider.keyHint}", fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f), modifier = Modifier.padding(top = 4.dp))
+
+                Section("Free backup cloud: Cloudflare (optional)")
+                Text(
+                    "Used automatically when the main cloud's free daily limit runs out (~3½ more free hours a day). " +
+                        "Free account at dash.cloudflare.com → AI → Workers AI → \"Use REST API\".",
+                    fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                )
+                OutlinedTextField(
+                    value = cfAccount,
+                    onValueChange = { cfAccount = it; s.cfAccountId = it },
+                    label = { Text("Cloudflare Account ID") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                )
+                OutlinedTextField(
+                    value = cfToken,
+                    onValueChange = { cfToken = it; s.cfToken = it },
+                    label = { Text("Cloudflare API token") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                )
             }
 
             if (mode != EngineMode.CLOUD) {
                 Section("Offline model")
+                Text(
+                    "Runs on the phone, free and unlimited. Speech is translated with Google's free offline " +
+                        "translator (each language's pack downloads once, ~30 MB, the first time it's heard).",
+                    fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                )
                 LocalModel.entries.forEach { m ->
                     val ready = remember(refresh, downloading) { models.isReady(m) }
                     val prog = downloading[m]

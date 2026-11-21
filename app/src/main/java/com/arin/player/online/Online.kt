@@ -78,7 +78,16 @@ object OnlineResolver {
         }
     }
 
-    suspend fun resolve(ctx: Context, url: String): ResolvedMedia = withContext(Dispatchers.IO) {
+    /** Page link -> streams, remembered for a while so re-opening a video starts at once. */
+    private val cache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, ResolvedMedia>>()
+    private const val CACHE_MS = 2 * 3_600_000L // stream links usually expire after ~6 h
+
+    suspend fun resolve(ctx: Context, url: String): ResolvedMedia {
+        cache[url]?.let { (t, r) -> if (System.currentTimeMillis() - t < CACHE_MS) return r }
+        return resolveFresh(ctx, url).also { cache[url] = System.currentTimeMillis() to it }
+    }
+
+    private suspend fun resolveFresh(ctx: Context, url: String): ResolvedMedia = withContext(Dispatchers.IO) {
         ensureInit(ctx)
         val req = YoutubeDLRequest(url)
             // Best video up to 1080p (avoid AV1: many phones can't hardware-decode it) + best audio,
@@ -90,6 +99,7 @@ object OnlineResolver {
             )
             .addOption("--no-playlist")
             .addOption("--no-warnings")
+            .addOption("--socket-timeout", "15")
         val info = YoutubeDL.getInstance().getInfo(req)
         val rf = info.requestedFormats
         val video: String?

@@ -95,6 +95,10 @@ dependencies {
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
+    // Free on-device translation (Google ML Kit) for offline / backup subtitles
+    implementation("com.google.mlkit:translate:17.0.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.9.0")
+
     // yt-dlp (+ Python + QuickJS) for YouTube and 1000+ other websites
     implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
 }

@@ -26,7 +26,7 @@ class ModelManager(context: Context) {
             val tmp = File(dir, m.file + ".part")
             try {
                 progress.update { it + (m to 0f) }
-                val resp = CloudTranscriber.http.newBuilder().callTimeout(0, java.util.concurrent.TimeUnit.SECONDS)
+                val resp = http.newBuilder().callTimeout(0, java.util.concurrent.TimeUnit.SECONDS)
                     .build().newCall(Request.Builder().url(m.url).build()).execute()
                 resp.use {
                     if (!it.isSuccessful) throw IllegalStateException("HTTP ${it.code}")

@@ -10,6 +10,19 @@
 
 #define TAG "ArinWhisper"
 
+// true if s is a complete, valid UTF-8 string (tokens can split a multi-byte character)
+static bool utf8_complete(const std::string &s) {
+    size_t i = 0, n = s.size();
+    while (i < n) {
+        unsigned char c = (unsigned char) s[i];
+        size_t len = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 0;
+        if (len == 0 || i + len > n) return false;
+        for (size_t k = 1; k < len; k++) if (((unsigned char) s[i + k] >> 6) != 0x2) return false;
+        i += len;
+    }
+    return true;
+}
+
 static std::string clean(const char *s) {
     std::string out = s ? s : "";
     for (char &c : out) if (c == '\n' || c == '\t' || c == '\r') c = ' ';
@@ -76,11 +89,18 @@ Java_com_arin_player_engine_WhisperLib_translate(JNIEnv *env, jobject, jlong ptr
                 out += "S\t" + std::to_string(t0) + "\t" + std::to_string(t1) + "\t" +
                        std::to_string(nsp) + "\t" + clean(whisper_full_get_segment_text(ctx, i)) + "\n";
                 int nt = whisper_full_n_tokens(ctx, i);
+                std::string pending;   // joins tokens until they form whole UTF-8 characters
+                long pendingT = 0;
                 for (int j = 0; j < nt; j++) {
                     whisper_token_data td = whisper_full_get_token_data(ctx, i, j);
                     if (td.id >= eot) continue; // special tokens ([_BEG_], timestamps…)
                     long t = td.t_dtw >= 0 ? (long) td.t_dtw * 10 : (long) td.t0 * 10;
-                    out += "T\t" + std::to_string(t) + "\t" + clean(whisper_token_to_str(ctx, td.id)) + "\n";
+                    if (pending.empty()) pendingT = t;
+                    pending += whisper_token_to_str(ctx, td.id);
+                    if (utf8_complete(pending)) {
+                        out += "T\t" + std::to_string(pendingT) + "\t" + clean(pending.c_str()) + "\n";
+                        pending.clear();
+                    }
                 }
             }
         } else {

@@ -28,7 +28,8 @@ enum class CloudProvider(
 enum class LocalModel(val label: String, val file: String, val sizeMb: Int, val note: String, val aheads: Int) {
     TINY("Tiny", "ggml-tiny.bin", 75, "Fastest, rough translation", 4),
     BASE("Base", "ggml-base.bin", 142, "Balanced", 6),
-    SMALL("Small", "ggml-small.bin", 466, "Best quality, needs a fast phone", 8);
+    SMALL("Small", "ggml-small.bin", 466, "Good quality, needs a fast phone", 8),
+    LARGE_TURBO("Large v3 Turbo", "ggml-large-v3-turbo-q5_0.bin", 547, "Most accurate, needs a recent flagship phone", 14);
 
     val url get() = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$file"
 }
@@ -47,6 +48,14 @@ class Settings(context: Context) {
     /** One key per provider so switching doesn't lose it. */
     fun apiKey(provider: CloudProvider = this.provider): String = p.getString("key_${provider.name}", "")!!.trim()
     fun setApiKey(provider: CloudProvider, key: String) = p.edit().putString("key_${provider.name}", key.trim()).apply()
+
+    /** Free backup cloud: Cloudflare Workers AI (used when the main cloud's free limit runs out). */
+    var cfAccountId: String
+        get() = p.getString("cf_account", "")!!.trim()
+        set(v) = p.edit().putString("cf_account", v.trim()).apply()
+    var cfToken: String
+        get() = p.getString("cf_token", "")!!.trim()
+        set(v) = p.edit().putString("cf_token", v.trim()).apply()
 
     var localModel: LocalModel
         get() = runCatching { LocalModel.valueOf(p.getString("local_model", null)!!) }.getOrDefault(LocalModel.BASE)

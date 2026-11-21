@@ -167,20 +167,7 @@ class SubtitleEngine(
             markDone(i, start, end, emptyList()); return
         }
 
-        val t = pickTranscriber()
-        status.value = "Subtitling ${fmt(start)}–${fmt(end)} (${t.label})"
-        val result = try {
-            t.translate(pcm)
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            // Cloud unreachable / out of quota: in Auto mode keep going with the offline model.
-            val local = local()
-            if (settings.mode == EngineMode.AUTO && t is CloudTranscriber && local != null) {
-                status.value = "Offline fallback ${fmt(start)}–${fmt(end)}"
-                local.translate(pcm)
-            } else throw e
-        }
+        val result = recognise(pcm, start, end)
 
         val voice = VoiceMap(pcm)
         val refined = result.lines.map { l -> voice.refine(l) }
@@ -239,16 +226,80 @@ class SubtitleEngine(
         return src.read(startMs, endMs)
     }
 
-    private fun pickTranscriber(): Transcriber = when (settings.mode) {
-        EngineMode.CLOUD -> cloud() ?: throw IllegalStateException("Add a cloud API key in Settings")
-        EngineMode.OFFLINE -> local() ?: throw IllegalStateException("Download an offline model in Settings")
-        EngineMode.AUTO -> (if (online()) cloud() else null) ?: local()
-            ?: if (cloud() != null) throw IllegalStateException("Offline — download an offline model in Settings")
-            else throw IllegalStateException("Add an API key or download an offline model in Settings")
+    /** Providers in order of preference; one whose free limit ran out is skipped for a while. */
+    private val pausedUntil = ConcurrentHashMap<String, Long>()
+
+    private fun candidates(): List<Transcriber> {
+        val mode = settings.mode
+        val now = System.currentTimeMillis()
+        val list = buildList {
+            if (mode != EngineMode.OFFLINE && online()) {
+                cloud()?.let(::add)
+                cloudflare()?.let(::add)
+            }
+            if (mode != EngineMode.CLOUD) local()?.let(::add)
+        }
+        if (list.isEmpty()) throw IllegalStateException(
+            when {
+                mode == EngineMode.OFFLINE -> "Download an offline model in Settings"
+                !online() && local() == null -> "No internet — download an offline model in Settings"
+                else -> "Add a free Groq API key (or download an offline model) in Settings"
+            }
+        )
+        val active = list.filter { (pausedUntil[it.id] ?: 0) < now }
+        return active.ifEmpty { list } // all paused: try anyway (limits may have reset)
+    }
+
+    /**
+     * Step 1: hear the words with exact timings (first provider that works).
+     * Step 2: translate each timed line to English (AI text model, else Google's offline translator,
+     *         else the recogniser's own audio translation).
+     */
+    private suspend fun recognise(pcm: FloatArray, start: Long, end: Long): ChunkResult {
+        var last: Exception? = null
+        for (t in candidates()) {
+            status.value = "Listening ${fmt(start)}–${fmt(end)} (${t.label})"
+            val heard = try {
+                t.transcribe(pcm)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                last = e
+                // Free limit used up: pause this provider for 15 min, use the next one meanwhile.
+                if (e is CloudException && e.code == 429) pausedUntil[t.id] = System.currentTimeMillis() + 15 * 60_000L
+                continue
+            }
+            if (heard.lines.isEmpty() || heard.lang == "EN") return heard
+            status.value = "Translating ${fmt(start)}–${fmt(end)}"
+            val english = translateLines(heard.lines.map { it.text }, heard.lang)
+            if (english != null) {
+                return ChunkResult(heard.lang, heard.lines.mapIndexed { i, l -> Line(l.startMs, l.endMs, english[i]) })
+            }
+            val direct = runCatching { t.audioToEnglish(pcm) }.getOrNull()
+            return if (direct != null && direct.lines.isNotEmpty()) direct.copy(lang = heard.lang)
+            else heard.copy(lines = heard.lines.map { it.copy(words = emptyList()) }) // original language
+        }
+        throw last ?: IllegalStateException("No subtitle engine available")
+    }
+
+    private suspend fun translateLines(lines: List<String>, lang: String): List<String>? {
+        val key = settings.apiKey()
+        if (key.isNotBlank() && settings.mode != EngineMode.OFFLINE && online()) {
+            runCatching { ChatTranslator(settings.provider, key).toEnglish(lines, lang) }
+                .getOrNull()?.let { return it }
+        }
+        if (MlKitTranslator.supports(lang)) {
+            runCatching { MlKitTranslator.toEnglish(lines, lang) }.getOrNull()?.let { return it }
+        }
+        return null
     }
 
     private fun cloud(): Transcriber? =
         settings.apiKey().takeIf { it.isNotBlank() }?.let { CloudTranscriber(settings.provider, it) }
+
+    private fun cloudflare(): Transcriber? =
+        if (settings.cfAccountId.isNotBlank() && settings.cfToken.isNotBlank())
+            CloudflareTranscriber(settings.cfAccountId, settings.cfToken) else null
 
     private fun local(): Transcriber? =
         settings.localModel.takeIf { models.isReady(it) }?.let { LocalTranscriber(models.file(it), it) }
