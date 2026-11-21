@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -27,3 +29,14 @@ jobs:
         with:
           name: ArinPlayer-apk
           path: app/build/outputs/apk/release/*.apk
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/release/*.apk ArinPlayer.apk
+
+      - name: Publish release (direct APK download)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Arin player build ${{ github.run_number }}
+          files: ArinPlayer.apk
+          make_latest: true
