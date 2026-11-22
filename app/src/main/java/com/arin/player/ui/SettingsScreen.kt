@@ -159,14 +159,6 @@ fun SettingsScreen(onClose: () -> Unit) {
             Section("Subtitles")
             Text("Text size: ${subSize.toInt()} sp")
             Slider(value = subSize, onValueChange = { subSize = it; s.subtitleSizeSp = it }, valueRange = 14f..34f)
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                Column(Modifier.weight(1f)) {
-                    Text("Show spoken language")
-                    Text("e.g. [JA] before lines translated from Japanese", fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
-                }
-                Switch(checked = langTag, onCheckedChange = { langTag = it; s.showLanguageTag = it })
-            }
             Section("Website support (YouTube & 1000+ sites)")
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                 Column(Modifier.weight(1f)) {

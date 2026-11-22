@@ -4,6 +4,8 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.view.KeyEvent
+import com.arin.player.vr.KeyRouter
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -77,6 +79,10 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    /** In VR, hardware keys (headset button, remotes, volume keys) control playback. */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean =
+        KeyRouter.handler?.invoke(event) == true || super.dispatchKeyEvent(event)
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)

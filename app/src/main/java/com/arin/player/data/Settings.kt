@@ -34,6 +34,17 @@ enum class LocalModel(val label: String, val file: String, val sizeMb: Int, val 
     val url get() = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$file"
 }
 
+/** How the video is laid out for VR. */
+enum class VrFormat(val label: String) {
+    AUTO("Auto-detect"),
+    FLAT("Normal video (big cinema screen)"),
+    SBS("3D side-by-side"),
+    TB("3D top-bottom"),
+    SPHERE360("360° video"),
+    SPHERE360_TB("360° 3D (top-bottom)"),
+    HALF180_SBS("VR180 3D (side-by-side)"),
+}
+
 class Settings(context: Context) {
     private val p = context.applicationContext.getSharedPreferences("arin_player", Context.MODE_PRIVATE)
 
@@ -71,6 +82,31 @@ class Settings(context: Context) {
         set(v) = p.edit().putString("recent_urls", v.take(8).joinToString("\n")).apply()
 
     fun addRecentUrl(url: String) { recentUrls = listOf(url) + recentUrls.filter { it != url } }
+
+    // ---- VR
+    var vrFormat: VrFormat
+        get() = runCatching { VrFormat.valueOf(p.getString("vr_format", null)!!) }.getOrDefault(VrFormat.AUTO)
+        set(v) = p.edit().putString("vr_format", v.name).apply()
+    /** Cinema screen size, 0.6 (small) .. 1.6 (huge). */
+    var vrScreenScale: Float
+        get() = p.getFloat("vr_screen", 1.0f)
+        set(v) = p.edit().putFloat("vr_screen", v).apply()
+    /** Distance between the eyes in mm. */
+    var vrIpdMm: Float
+        get() = p.getFloat("vr_ipd", 63f)
+        set(v) = p.edit().putFloat("vr_ipd", v).apply()
+    var vrLensCorrection: Boolean
+        get() = p.getBoolean("vr_lens", true)
+        set(v) = p.edit().putBoolean("vr_lens", v).apply()
+    var vrTiltSeek: Boolean
+        get() = p.getBoolean("vr_tilt", true)
+        set(v) = p.edit().putBoolean("vr_tilt", v).apply()
+    var vrVolumeKeys: Boolean
+        get() = p.getBoolean("vr_volkeys", true)
+        set(v) = p.edit().putBoolean("vr_volkeys", v).apply()
+    var vrVoice: Boolean
+        get() = p.getBoolean("vr_voice", false)
+        set(v) = p.edit().putBoolean("vr_voice", v).apply()
 
     var showLanguageTag: Boolean
         get() = p.getBoolean("lang_tag", true)

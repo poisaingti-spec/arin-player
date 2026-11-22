@@ -78,6 +78,10 @@ import org.videolan.libvlc.Media
 import org.videolan.libvlc.MediaPlayer
 import org.videolan.libvlc.util.VLCVideoLayout
 import java.util.Locale
+import androidx.activity.compose.BackHandler
+import androidx.compose.material.icons.filled.ViewInAr
+import com.arin.player.vr.VrScreen
+import com.arin.player.vr.VrSetupDialog
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.height
 import androidx.compose.ui.geometry.CornerRadius
@@ -193,6 +197,9 @@ private fun PlayerContent(
     var dragging by remember { mutableStateOf<Float?>(null) }
     var showControls by remember { mutableStateOf(true) }
     var subsOn by remember { mutableStateOf(true) }
+    var showVrSetup by remember { mutableStateOf(false) }
+    var vrOn by remember { mutableStateOf(false) }
+    var vrUsed by remember { mutableStateOf(false) }
     var menuOpen by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var lastTouch by remember { mutableLongStateOf(0L) }
@@ -320,11 +327,9 @@ private fun PlayerContent(
 
         // ---- subtitle
         if (subsOn && current != null) {
-            val tag = if (showLangTag && current.lang.isNotBlank() && current.lang != "EN") "[${current.lang}] " else ""
             // English speech: words light up exactly as they're spoken. Translated lines appear whole,
             // timed to when that line is spoken.
             val styled = buildAnnotatedString {
-                append(tag)
                 if (current.words.isEmpty()) {
                     append(current.text)
                 } else {
@@ -382,6 +387,9 @@ private fun PlayerContent(
                 ) {
                     IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = Color.White) }
                     Text(title, color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                    IconButton(onClick = { showVrSetup = true }) {
+                        Icon(Icons.Filled.ViewInAr, "VR mode", tint = Color.White)
+                    }
                     IconButton(onClick = { subsOn = !subsOn }) {
                         Icon(if (subsOn) Icons.Filled.ClosedCaption else Icons.Filled.ClosedCaptionDisabled, "Subtitles", tint = Color.White)
                     }
@@ -393,6 +401,7 @@ private fun PlayerContent(
                                 enabled = cues.isNotEmpty(),
                                 onClick = { menuOpen = false; exporter.launch(title.substringBeforeLast('.') + ".en.srt") },
                             )
+                            DropdownMenuItem(text = { Text("VR mode") }, onClick = { menuOpen = false; showVrSetup = true })
                             DropdownMenuItem(text = { Text("Settings") }, onClick = { menuOpen = false; onSettings() })
                         }
                     }
@@ -476,7 +485,41 @@ private fun PlayerContent(
                 }
             }
         }
+
+        // ---- VR: stereo view on top of everything, the player draws into it
+        if (vrOn) {
+            VrScreen(
+                player = player,
+                title = title,
+                posMs = posMs,
+                lenMs = lenMs,
+                isPlaying = isPlaying,
+                subtitle = current?.text.orEmpty(),
+                subtitlesOn = subsOn,
+                onToggleSubtitles = { subsOn = !subsOn },
+                onExit = { vrOn = false },
+            )
+        }
     }
+
+    if (showVrSetup) {
+        VrSetupDialog(
+            title = title,
+            onStart = {
+                showVrSetup = false
+                player.detachViews() // hand the picture to the VR renderer
+                vrUsed = true
+                vrOn = true
+                if (!player.isPlaying) player.play()
+            },
+            onDismiss = { showVrSetup = false },
+        )
+    }
+    // Back from VR: give the picture back to the normal screen
+    LaunchedEffect(vrOn) {
+        if (!vrOn && vrUsed) player.attachViews(videoLayout, null, false, false)
+    }
+    BackHandler(enabled = vrOn) { vrOn = false }
 }
 
 private fun fmt(ms: Long): String {
