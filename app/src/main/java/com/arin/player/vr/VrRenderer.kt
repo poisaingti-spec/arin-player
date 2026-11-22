@@ -57,6 +57,7 @@ data class VrConfig(
     val ipdMm: Float,
     val lensCorrection: Boolean,
     val tiltSeek: Boolean,
+    val screenPitch: Float = 0f,
 )
 
 /**
@@ -70,9 +71,21 @@ data class VrConfig(
  */
 class VrRenderer(
     context: Context,
-    private val config: VrConfig,
+    initial: VrConfig,
     private val actions: VrActions,
 ) : GLSurfaceView.Renderer, SensorEventListener {
+
+    /** Current settings; changed from inside the headset via the ⚙ Screen page. */
+    @Volatile var config: VrConfig = initial
+        private set
+    /** Called (main thread) after the user changes a setting in the headset, to save it. */
+    var onConfigChanged: ((VrConfig) -> Unit)? = null
+
+    private fun update(c: VrConfig, osd: String) {
+        config = c
+        showOsd(osd)
+        main.post { onConfigChanged?.invoke(c) }
+    }
 
     // ---- state pushed in from the player (any thread)
     @Volatile var posMs = 0L
@@ -132,6 +145,10 @@ class VrRenderer(
     private var osdText = ""
     private var osdUntil = 0L
 
+    // ---- control panel appears only when you look down
+    private var ctrlAlpha = 0f
+    private var page = Page.MAIN
+
     // ---- gaze interaction
     private var hovered: Btn? = null
     private var hoverStart = 0L
@@ -152,6 +169,8 @@ class VrRenderer(
     // =============================================================================================
 
     fun start() {
+        osdText = "Look down for controls"
+        osdUntil = SystemClock.uptimeMillis() + 4000
         val s = sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
             ?: sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
         if (s != null) sensorManager.registerListener(this, s, SensorManager.SENSOR_DELAY_FASTEST)
@@ -330,7 +349,7 @@ class VrRenderer(
             VrFormat.HALF180_SBS -> drawVideo(hemisphere, vp, identity, uOff, vOff, uScale, vScale)
             else -> {
                 val (sw, sh) = screenSize()
-                val m = panelModel(0f, 0f, SCREEN_DIST, sw, sh)
+                val m = panelModel(config.screenPitch, 0f, SCREEN_DIST, sw, sh)
                 drawVideo(quad, vp, m, uOff, vOff, uScale, vScale)
             }
         }
@@ -344,22 +363,26 @@ class VrRenderer(
                 val ph = sw * subtitlePanel.h / subtitlePanel.w
                 val m = FloatArray(16)
                 Matrix.setIdentityM(m, 0)
+                Matrix.rotateM(m, 0, config.screenPitch, 1f, 0f, 0f)
                 Matrix.translateM(m, 0, 0f, -sh / 2 - ph / 2 - 0.04f, -SCREEN_DIST + 0.01f)
                 Matrix.scaleM(m, 0, sw, ph, 1f)
                 draw2d(subtitlePanel.tex, quad, vp, m, 1f)
             }
         }
 
-        // Control panel: look down to use it.
-        draw2d(controlPanel.tex, quad, vp, panelModel(CTRL_PITCH, 0f, CTRL_DIST, CTRL_W, CTRL_W * controlPanel.h / controlPanel.w),
-            if (hovered != null) 1f else 0.85f)
+        // Control panel: only there when you look down.
+        if (ctrlAlpha > 0.02f) {
+            draw2d(controlPanel.tex, quad, vp, panelModel(CTRL_PITCH, 0f, CTRL_DIST, CTRL_W, CTRL_W * controlPanel.h / controlPanel.w),
+                ctrlAlpha)
+        }
 
         // Seek / status messages in front of you
         if (now < osdUntil) {
             draw2d(osdPanel.tex, quad, vp, panelModel(-6f, 0f, 1.9f, 0.7f, 0.7f * osdPanel.h / osdPanel.w), 1f)
         }
 
-        // Gaze dot (fixed in front of the eyes)
+        // Gaze dot (fixed in front of the eyes), only while the controls are showing
+        if (ctrlAlpha <= 0.02f) return
         val rm = FloatArray(16)
         Matrix.setIdentityM(rm, 0)
         Matrix.translateM(rm, 0, if (isSphere) 0f else (if (eye == 0) ipd / 2 else -ipd / 2) * 0f, 0f, -1.5f)
@@ -374,6 +397,7 @@ class VrRenderer(
         GLES20.glUniform2f(GLES20.glGetUniformLocation(progReticle, "uUvScale"), 1f, 1f)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(progReticle, "uProgress"), reticleProgress)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(progReticle, "uActive"), if (hovered != null) 1f else 0f)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(progReticle, "uAlpha"), ctrlAlpha)
         quad.draw(progReticle)
     }
 
@@ -467,22 +491,58 @@ class VrRenderer(
     // Gaze buttons
     // =============================================================================================
 
-    private enum class Btn { BACK60, BACK10, PLAY, FWD10, FWD60, SEEKBAR, RECENTER, SUBS, EXIT }
+    private enum class Page { MAIN, SCREEN }
 
-    private val buttons = linkedMapOf(
+    private enum class Btn {
+        BACK60, BACK10, PLAY, FWD10, FWD60, SEEKBAR, SETTINGS, SUBS, EXIT,
+        SIZE_MINUS, SIZE_PLUS, UP, DOWN, TYPE, EYE_MINUS, EYE_PLUS, LENS, TILT, RECENTER, RESET, DONE,
+    }
+
+    private val mainButtons = linkedMapOf(
         Btn.BACK60 to RectF(20f, 20f, 240f, 170f),
         Btn.BACK10 to RectF(255f, 20f, 475f, 170f),
         Btn.PLAY to RectF(490f, 20f, 710f, 170f),
         Btn.FWD10 to RectF(725f, 20f, 945f, 170f),
         Btn.FWD60 to RectF(960f, 20f, 1180f, 170f),
         Btn.SEEKBAR to RectF(30f, 185f, 1170f, 265f),
-        Btn.RECENTER to RectF(470f, 285f, 700f, 400f),
+        Btn.SETTINGS to RectF(470f, 285f, 700f, 400f),
         Btn.SUBS to RectF(715f, 285f, 945f, 400f),
         Btn.EXIT to RectF(960f, 285f, 1180f, 400f),
     )
 
+    /** ⚙ Screen page: adjust everything from inside the headset. */
+    private val screenButtons = linkedMapOf(
+        Btn.SIZE_MINUS to RectF(20f, 20f, 240f, 145f),
+        Btn.SIZE_PLUS to RectF(255f, 20f, 475f, 145f),
+        Btn.UP to RectF(490f, 20f, 710f, 145f),
+        Btn.DOWN to RectF(725f, 20f, 945f, 145f),
+        Btn.TYPE to RectF(960f, 20f, 1180f, 145f),
+        Btn.EYE_MINUS to RectF(20f, 160f, 240f, 280f),
+        Btn.EYE_PLUS to RectF(255f, 160f, 475f, 280f),
+        Btn.LENS to RectF(490f, 160f, 710f, 280f),
+        Btn.TILT to RectF(725f, 160f, 945f, 280f),
+        Btn.RECENTER to RectF(960f, 160f, 1180f, 280f),
+        Btn.RESET to RectF(725f, 295f, 945f, 400f),
+        Btn.DONE to RectF(960f, 295f, 1180f, 400f),
+    )
+
+    private val buttons get() = if (page == Page.MAIN) mainButtons else screenButtons
+    private val repeating = setOf(
+        Btn.BACK10, Btn.FWD10, Btn.BACK60, Btn.FWD60,
+        Btn.SIZE_MINUS, Btn.SIZE_PLUS, Btn.UP, Btn.DOWN, Btn.EYE_MINUS, Btn.EYE_PLUS,
+    )
+
     private fun updateGaze(now: Long) {
         if (!hasRotation) return
+        // Show the controls only while looking down (or while using them).
+        val pitchDeg = Math.toDegrees(asin(forward()[1].coerceIn(-1f, 1f).toDouble())).toFloat()
+        val want = pitchDeg < SHOW_BELOW_DEG || (hovered != null && pitchDeg < SHOW_BELOW_DEG + 12f)
+        ctrlAlpha += ((if (want) 1f else 0f) - ctrlAlpha) * 0.18f
+        if (!want && ctrlAlpha < 0.05f && page != Page.MAIN) page = Page.MAIN
+        if (ctrlAlpha < 0.6f) {
+            hovered = null; reticleProgress = 0f
+            return
+        }
         val m = panelModel(CTRL_PITCH, 0f, CTRL_DIST, CTRL_W, CTRL_W * controlPanel.h / controlPanel.w)
         val inv = FloatArray(16)
         if (!Matrix.invertM(inv, 0, m, 0)) return
@@ -515,7 +575,7 @@ class VrRenderer(
         if (hit != null && now - hoverStart >= dwell && now - lastClick > 600) {
             click(hit, frac)
             // seek buttons repeat while you keep looking; others need you to look away first
-            hoverStart = if (hit in setOf(Btn.BACK10, Btn.FWD10, Btn.BACK60, Btn.FWD60)) now - dwell / 3 else Long.MAX_VALUE / 2
+            hoverStart = if (hit in repeating) now - dwell / 3 else Long.MAX_VALUE / 2
         }
     }
 
@@ -532,10 +592,36 @@ class VrRenderer(
                 showOsd("⇥  ${fmt(target)}")
                 main.post { actions.seekTo(target) }
             }
-            Btn.RECENTER -> { recenter(); showOsd("◎  Recentred") }
             Btn.SUBS -> { showOsd(if (subtitlesOn) "Subtitles off" else "Subtitles on"); main.post { actions.toggleSubtitles() } }
             Btn.EXIT -> main.post { actions.exit() }
+            Btn.SETTINGS -> { page = Page.SCREEN; hovered = null }
+            Btn.DONE -> { page = Page.MAIN; hovered = null }
+            Btn.RECENTER -> { recenter(); showOsd("◎  Recentred") }
+            Btn.SIZE_MINUS -> config.copy(screenScale = (config.screenScale - 0.1f).coerceAtLeast(0.4f)).let { update(it, "Screen ${(it.screenScale * 100).toInt()}%") }
+            Btn.SIZE_PLUS -> config.copy(screenScale = (config.screenScale + 0.1f).coerceAtMost(2.2f)).let { update(it, "Screen ${(it.screenScale * 100).toInt()}%") }
+            Btn.UP -> config.copy(screenPitch = (config.screenPitch + 3f).coerceAtMost(40f)).let { update(it, "Screen ▲ ${it.screenPitch.toInt()}°") }
+            Btn.DOWN -> config.copy(screenPitch = (config.screenPitch - 3f).coerceAtLeast(-40f)).let { update(it, "Screen ▼ ${it.screenPitch.toInt()}°") }
+            Btn.EYE_MINUS -> config.copy(ipdMm = (config.ipdMm - 1f).coerceAtLeast(52f)).let { update(it, "Eye distance ${it.ipdMm.toInt()} mm") }
+            Btn.EYE_PLUS -> config.copy(ipdMm = (config.ipdMm + 1f).coerceAtMost(78f)).let { update(it, "Eye distance ${it.ipdMm.toInt()} mm") }
+            Btn.LENS -> config.copy(lensCorrection = !config.lensCorrection).let { update(it, if (it.lensCorrection) "Lens correction on" else "Lens correction off") }
+            Btn.TILT -> config.copy(tiltSeek = !config.tiltSeek).let { update(it, if (it.tiltSeek) "Tilt to skip on" else "Tilt to skip off") }
+            Btn.TYPE -> {
+                val all = VrFormat.entries.filter { it != VrFormat.AUTO }
+                val next = all[(all.indexOf(config.format) + 1) % all.size]
+                update(config.copy(format = next), shortName(next))
+            }
+            Btn.RESET -> update(config.copy(screenScale = 1f, screenPitch = 0f, ipdMm = 63f, lensCorrection = true), "Reset to default")
         }
+    }
+
+    private fun shortName(f: VrFormat) = when (f) {
+        VrFormat.FLAT -> "2D cinema"
+        VrFormat.SBS -> "3D side-by-side"
+        VrFormat.TB -> "3D top-bottom"
+        VrFormat.SPHERE360 -> "360°"
+        VrFormat.SPHERE360_TB -> "360° 3D"
+        VrFormat.HALF180_SBS -> "VR180"
+        VrFormat.AUTO -> "Auto"
     }
 
     private fun seek(delta: Long) {
@@ -608,7 +694,7 @@ class VrRenderer(
             subtitlePanel.upload()
         }
 
-        val key = "${posMs / 1000}|$lenMs|$playing|$hovered|$subtitlesOn|${(hoverSeekFrac * 200).toInt()}"
+        val key = "${posMs / 1000}|$lenMs|$playing|$hovered|$subtitlesOn|${(hoverSeekFrac * 200).toInt()}|$page|$config"
         if (key != lastControlKey || controlPanel.tex == 0) {
             lastControlKey = key
             drawControls()
@@ -630,6 +716,7 @@ class VrRenderer(
     }
 
     private fun drawControls() {
+        if (page == Page.SCREEN) { drawScreenPage(); return }
         controlPanel.draw { c, w, h ->
             val bg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(215, 18, 15, 30) }
             c.drawRoundRect(RectF(0f, 0f, w.toFloat(), h.toFloat()), 36f, 36f, bg)
@@ -641,7 +728,7 @@ class VrRenderer(
                 Btn.BACK60 to "⏪ 1 min", Btn.BACK10 to "⏪ 10 s",
                 Btn.PLAY to if (playing) "⏸ Pause" else "▶ Play",
                 Btn.FWD10 to "10 s ⏩", Btn.FWD60 to "1 min ⏩",
-                Btn.RECENTER to "◎ Centre", Btn.SUBS to if (subtitlesOn) "CC on" else "CC off", Btn.EXIT to "✕ Exit VR",
+                Btn.SETTINGS to "⚙ Screen", Btn.SUBS to if (subtitlesOn) "CC on" else "CC off", Btn.EXIT to "✕ Exit VR",
             )
             for ((b, r) in buttons) {
                 if (b == Btn.SEEKBAR) continue
@@ -668,6 +755,35 @@ class VrRenderer(
             }
             val time = Paint(txt).apply { textAlign = Paint.Align.LEFT; textSize = 44f; typeface = Typeface.DEFAULT }
             c.drawText("${fmt(posMs)} / ${fmt(lenMs)}", 40f, 355f, time)
+        }
+    }
+
+    private fun drawScreenPage() {
+        controlPanel.draw { c, w, h ->
+            val bg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(215, 18, 15, 30) }
+            c.drawRoundRect(RectF(0f, 0f, w.toFloat(), h.toFloat()), 36f, 36f, bg)
+            val btnBg = Paint(Paint.ANTI_ALIAS_FLAG)
+            val txt = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE; textSize = 40f; typeface = Typeface.DEFAULT_BOLD; textAlign = Paint.Align.CENTER
+            }
+            val cfg = config
+            val labels = mapOf(
+                Btn.SIZE_MINUS to "Size −", Btn.SIZE_PLUS to "Size +",
+                Btn.UP to "Move ▲", Btn.DOWN to "Move ▼", Btn.TYPE to shortName(cfg.format),
+                Btn.EYE_MINUS to "Eyes −", Btn.EYE_PLUS to "Eyes +",
+                Btn.LENS to if (cfg.lensCorrection) "Lens ✓" else "Lens ✗",
+                Btn.TILT to if (cfg.tiltSeek) "Tilt ✓" else "Tilt ✗",
+                Btn.RECENTER to "◎ Centre", Btn.RESET to "↺ Reset", Btn.DONE to "✓ Done",
+            )
+            for ((b, r) in screenButtons) {
+                btnBg.color = if (b == hovered) Color.rgb(139, 92, 246) else Color.argb(60, 255, 255, 255)
+                c.drawRoundRect(r, 26f, 26f, btnBg)
+                txt.textSize = if ((labels[b] ?: "").length > 9) 34f else 40f
+                c.drawText(labels[b] ?: "", r.centerX(), r.centerY() + txt.textSize / 3, txt)
+            }
+            val info = Paint(txt).apply { textAlign = Paint.Align.LEFT; textSize = 36f; typeface = Typeface.DEFAULT }
+            c.drawText("Size ${(cfg.screenScale * 100).toInt()}%  ·  Height ${cfg.screenPitch.toInt()}°", 30f, 340f, info)
+            c.drawText("Eyes ${cfg.ipdMm.toInt()} mm  ·  ${shortName(cfg.format)}", 30f, 385f, info)
         }
     }
 
@@ -785,6 +901,8 @@ class VrRenderer(
         private const val CTRL_DIST = 1.7f
         private const val CTRL_W = 1.5f
         private const val TILT_DEG = 22f
+        /** Controls fade in when you look further down than this. */
+        private const val SHOW_BELOW_DEG = -22f
 
         /** Column-major matrix taking GL scene coords (y up, -z forward) to Android world (z up). */
         private val GL_TO_ANDROID = floatArrayOf(
@@ -859,6 +977,7 @@ class VrRenderer(
             precision mediump float;
             uniform float uProgress;
             uniform float uActive;
+            uniform float uAlpha;
             varying vec2 vRaw;
             void main() {
                 vec2 p = vRaw * 2.0 - 1.0;
@@ -869,7 +988,7 @@ class VrRenderer(
                 float prog = ring * step(ang, uProgress);
                 vec3 col = mix(vec3(1.0), vec3(0.55, 0.36, 0.96), prog);
                 float a = max(dotA * (0.6 + 0.4 * uActive), max(prog, ring * 0.35 * uActive));
-                gl_FragColor = vec4(col, a);
+                gl_FragColor = vec4(col, a * uAlpha);
             }
         """
 

@@ -61,9 +61,16 @@ fun VrScreen(
     val renderer = remember {
         VrRenderer(
             ctx,
-            VrConfig(format, settings.vrScreenScale, settings.vrIpdMm, settings.vrLensCorrection, settings.vrTiltSeek),
+            VrConfig(format, settings.vrScreenScale, settings.vrIpdMm, settings.vrLensCorrection, settings.vrTiltSeek, settings.vrScreenPitch),
             actions,
-        )
+        ).also { r ->
+            // Changes made inside the headset are saved for next time
+            r.onConfigChanged = { c ->
+                settings.vrScreenScale = c.screenScale; settings.vrIpdMm = c.ipdMm
+                settings.vrLensCorrection = c.lensCorrection; settings.vrTiltSeek = c.tiltSeek
+                settings.vrScreenPitch = c.screenPitch; settings.vrFormat = c.format
+            }
+        }
     }
 
     // Keep the renderer up to date with the player

@@ -95,6 +95,10 @@ class Settings(context: Context) {
     var vrIpdMm: Float
         get() = p.getFloat("vr_ipd", 63f)
         set(v) = p.edit().putFloat("vr_ipd", v).apply()
+    /** Screen raised (+) / lowered (−) in degrees. */
+    var vrScreenPitch: Float
+        get() = p.getFloat("vr_pitch", 0f)
+        set(v) = p.edit().putFloat("vr_pitch", v).apply()
     var vrLensCorrection: Boolean
         get() = p.getBoolean("vr_lens", true)
         set(v) = p.edit().putBoolean("vr_lens", v).apply()
