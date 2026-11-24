@@ -20,6 +20,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Slider
@@ -101,15 +102,15 @@ fun SettingsScreen(onClose: () -> Unit) {
                     visualTransformation = PasswordVisualTransformation(),
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                 )
-                Text("Get one free at ${provider.keyHint}", fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f), modifier = Modifier.padding(top = 4.dp))
+                KeyLink("Get ${provider.label.substringBefore(" (")} API key (free) ↗", "https://${provider.keyHint}")
 
                 Section("Free backup cloud: Cloudflare (optional)")
                 Text(
                     "Used automatically when the main cloud's free daily limit runs out (~3½ more free hours a day). " +
-                        "Free account at dash.cloudflare.com → AI → Workers AI → \"Use REST API\".",
+                        "Tap the button below → REST API → Create a Workers AI API Token. The Account ID is on the same panel.",
                     fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
                 )
+
                 OutlinedTextField(
                     value = cfAccount,
                     onValueChange = { cfAccount = it; s.cfAccountId = it },
@@ -117,6 +118,9 @@ fun SettingsScreen(onClose: () -> Unit) {
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                 )
+                Text("32 letters/numbers. Shown under \"Account ID\" in the REST API panel, with a copy button.",
+                    fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f), modifier = Modifier.padding(top = 4.dp))
+                KeyLink("Get my Cloudflare Account ID ↗", CF_WORKERS_AI_URL)
                 OutlinedTextField(
                     value = cfToken,
                     onValueChange = { cfToken = it; s.cfToken = it },
@@ -125,6 +129,8 @@ fun SettingsScreen(onClose: () -> Unit) {
                     visualTransformation = PasswordVisualTransformation(),
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                 )
+                KeyLink("Get Cloudflare API token ↗", CF_WORKERS_AI_URL)
+                KeyLink("Manage Cloudflare tokens ↗", CF_TOKENS_URL)
             }
 
             if (mode != EngineMode.CLOUD) {
@@ -221,4 +227,27 @@ private fun RadioRow(title: String, subtitle: String, selected: Boolean, onClick
             Text(subtitle, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
         }
     }
+}
+
+/** Opens Cloudflare's Workers AI page for the signed-in account (REST API panel: token + Account ID). */
+private const val CF_WORKERS_AI_URL = "https://dash.cloudflare.com/?to=/:account/ai/workers-ai"
+private const val CF_TOKENS_URL = "https://dash.cloudflare.com/profile/api-tokens"
+
+/** A button that opens the page where the user creates / updates an API key, in their browser. */
+@Composable
+private fun KeyLink(label: String, url: String) {
+    val ctx = LocalContext.current
+    OutlinedButton(
+        onClick = {
+            try {
+                ctx.startActivity(
+                    android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url))
+                        .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            } catch (e: Exception) {
+                android.widget.Toast.makeText(ctx, "No browser found. Open $url", android.widget.Toast.LENGTH_LONG).show()
+            }
+        },
+        modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+    ) { Text(label) }
 }
