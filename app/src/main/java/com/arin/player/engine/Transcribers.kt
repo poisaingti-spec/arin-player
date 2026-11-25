@@ -90,8 +90,29 @@ private fun errorMessage(txt: String): String = runCatching {
         ?: txt.take(120)
 }.getOrDefault(txt.take(120))
 
-private fun isSilentSeg(s: JSONObject) =
-    s.optDouble("no_speech_prob", 0.0) > 0.6 && s.optDouble("avg_logprob", 0.0) < -1.0
+/** Lines Whisper often invents in music / silence (only dropped when Whisper also doubts them). */
+private val FILLERS = Regex(
+    """^(thank you\.?|thanks for watching.*|thank you for watching.*|please subscribe.*|subscribe.*|""" +
+        """like and subscribe.*|subtitles by.*|.*amara\.org.*|you|bye\.?)$""",
+    RegexOption.IGNORE_CASE,
+)
+/** Never dialogue: "[Music]", "(applause)", "♪", "...". */
+private val NON_SPEECH = Regex("""^(\.+|\[.*]|\(.*\)|♪.*|\*.*\*)$""")
+
+fun isNonSpeech(text: String) = NON_SPEECH.matches(text.trim())
+fun isFiller(text: String) = FILLERS.matches(text.trim())
+
+/**
+ * Drop a segment only when Whisper marks it as probably-not-speech AND it looks made up (very short
+ * or a known filler). Real speech over music at the start/end of a film is kept.
+ */
+private fun isSilentSeg(s: JSONObject): Boolean {
+    val text = s.optString("text").trim()
+    if (text.isBlank() || isNonSpeech(text)) return true
+    val doubtful = s.optDouble("no_speech_prob", 0.0) > 0.6 || s.optDouble("avg_logprob", 0.0) < -1.0
+    val flagged = s.optDouble("no_speech_prob", 0.0) > 0.6 && s.optDouble("avg_logprob", 0.0) < -1.0
+    return (doubtful && isFiller(text)) || (flagged && text.split(Regex("\\s+")).size <= 3)
+}
 
 // ---------------------------------------------------------------------------------------------
 // Groq / OpenAI
@@ -174,7 +195,8 @@ class CloudflareTranscriber(private val accountId: String, private val token: St
             .put("audio", audio)
             .put("task", task)
             .put("condition_on_previous_text", false)
-            .put("vad_filter", true)
+            // Off: its voice filter drops quiet speech (often the first/last lines of a film).
+            .put("vad_filter", false)
         if (lang != null) req.put("language", lang.lowercase())
         val o = JSONObject(postWithRetry(url, token, req.toString().toRequestBody("application/json".toMediaType())))
         if (o.has("success") && !o.optBoolean("success")) {
@@ -274,7 +296,8 @@ class LocalTranscriber(private val modelFile: File, private val model: LocalMode
         val noSpace = LineBuilder.isNoSpace(textLang)
         val lines = mutableListOf<Line>()
         for (s in segs) {
-            if (s.text.isBlank() || s.noSpeech > 0.8f || (s.text.startsWith("[") && s.text.endsWith("]"))) continue
+            if (s.text.isBlank() || isNonSpeech(s.text) || (s.noSpeech > 0.5f && isFiller(s.text)) ||
+                (s.noSpeech > 0.8f && s.text.split(Regex("\\s+")).size <= 3)) continue
             // Tokens -> words. Spaced languages: a token starting with a space begins a new word.
             // Japanese/Chinese/Thai: every token is its own unit.
             val words = mutableListOf<Word>()

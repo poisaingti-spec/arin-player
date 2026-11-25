@@ -35,7 +35,9 @@ import kotlin.math.sqrt
 /**
  * Turns the WHOLE video's audio into English subtitles, any length.
  *
- *  - Audio is processed in ~30 s pieces, starting where you're watching, then the rest of the video
+ *  - Each piece is heard with 2 s of overlap and silence padding, the last piece reads to the very end,
+ *    and any voiced stretch left without a line is heard again, so nothing from start to end is missed.
+ *  - Audio is processed in ~60 s pieces, starting where you're watching, then the rest of the video
  *    (after the end it wraps round to the beginning) until every piece is done.
  *  - Piece edges are moved to the quietest moment nearby, so no word is cut in half.
  *  - Each line is timed from word timestamps, then snapped to the actual start/end of the voice.
@@ -58,6 +60,12 @@ class SubtitleEngine(
         /** Keep a line on screen a little after the voice stops (easier to read). */
         const val HOLD_MS = 350L
         const val MIN_SHOW_MS = 900L
+        /** Each piece is heard with 2 s of the neighbouring audio on both sides, so words at the edges aren't lost. */
+        const val OVERLAP_MS = 2_000L
+        /** Silence added before/after the audio sent to Whisper: it often drops the very first/last words otherwise. */
+        const val PAD_MS = 700L
+        /** A stretch of voice this long with no subtitle is heard again on its own. */
+        const val GAP_MS = 3_500L
     }
 
     private val ctx = context.applicationContext
@@ -126,6 +134,20 @@ class SubtitleEngine(
         if (abs(ms - old) > 5_000) wake.trySend(Unit) // seek -> re-prioritise
     }
 
+    /** Loudness of the loudest 20 ms in the audio: 0 only when the whole stretch is silent. */
+    private fun peakFrameRms(pcm: FloatArray): Float {
+        val frame = SAMPLE_RATE / 50
+        var best = 0f
+        var p = 0
+        while (p + frame <= pcm.size) {
+            var e = 0.0
+            for (j in p until p + frame) e += pcm[j] * pcm[j]
+            best = max(best, sqrt(e / frame).toFloat())
+            p += frame
+        }
+        return best
+    }
+
     fun stop() {
         job?.cancel()
         vlc?.close()
@@ -170,33 +192,76 @@ class SubtitleEngine(
     private suspend fun process(i: Int) {
         val start = edge(i)
         val end = edge(i + 1)
+        val last = i == done.size - 1
         status.value = "Listening ${fmt(start)}–${fmt(end)}"
 
-        val pcm = readAudio(start, end)
+        // Read a little extra on both sides. The last piece reads past the reported length, so
+        // speech in the final seconds (or after a slightly short duration) is never cut off.
+        val readFrom = max(0, start - OVERLAP_MS)
+        val readTo = if (last) durationMs + 10_000 else min(durationMs, end + OVERLAP_MS)
+        val pcm = readAudio(readFrom, readTo)
         if (pcm == null) {
             markDone(i, start, end, emptyList())
             status.value = "No audio track found"
             return
         }
-        // Total silence: nothing to subtitle (saves API cost and avoids hallucinated lines).
-        if (pcm.size < SAMPLE_RATE / 2 || rms(pcm) < 0.0015f) {
+        // Only skip when there is truly no sound at all (quiet speech at the start/end must still be heard).
+        if (pcm.size < SAMPLE_RATE / 4 || peakFrameRms(pcm) < 0.002f) {
             markDone(i, start, end, emptyList()); return
         }
 
-        val result = recognise(pcm, start, end)
-
+        // Times below are relative to readFrom. This piece owns lines that START inside [start, end).
+        val ownFrom = start - readFrom
+        val ownTo = if (last) Long.MAX_VALUE else end - readFrom
+        val result = recognise(padded(pcm), start, end).shifted(-PAD_MS)
         val voice = VoiceMap(pcm)
-        val refined = result.lines.map { l -> voice.refine(l) }
-        val newCues = refined.mapIndexedNotNull { idx, l ->
+        val lines = result.lines.filter { it.startMs in ownFrom until ownTo }.toMutableList()
+        val langOf = HashMap<Line, String>().apply { lines.forEach { put(it, result.lang) } }
+
+        // Gap check: any stretch of voice with no subtitle (Whisper sometimes skips speech under
+        // music, or right after a long silence) is heard again on its own.
+        val ownEndMs = min(ownTo, pcm.size * 1000L / SAMPLE_RATE)
+        for ((gs, ge) in voice.uncovered(lines, ownFrom, ownEndMs, GAP_MS).take(4)) {
+            val a = max(0, gs - 400)
+            val b = min(pcm.size * 1000L / SAMPLE_RATE, ge + 400)
+            status.value = "Re-checking ${fmt(readFrom + a)}–${fmt(readFrom + b)}"
+            val sub = runCatching {
+                recognise(padded(pcm.copyOfRange((a * SAMPLE_RATE / 1000).toInt(), (b * SAMPLE_RATE / 1000).toInt())),
+                    readFrom + a, readFrom + b).shifted(a - PAD_MS)
+            }.getOrNull() ?: continue
+            sub.lines.filter { it.startMs in gs until ge && lines.none { o -> overlaps(o, it) } }
+                .forEach { lines += it; langOf[it] = sub.lang }
+        }
+        lines.sortBy { it.startMs }
+
+        val refined = lines.map { l -> voice.refine(l) to (langOf[l] ?: result.lang) }
+        val newCues = refined.mapIndexedNotNull { idx, (l, lang) ->
             if (l.text.isBlank()) return@mapIndexedNotNull null
-            val nextStart = refined.getOrNull(idx + 1)?.startMs ?: Long.MAX_VALUE
-            val s = start + l.startMs
+            val nextStart = refined.getOrNull(idx + 1)?.first?.startMs ?: Long.MAX_VALUE
+            val s = readFrom + l.startMs
             // Show until the voice stops (+ a short hold), at least MIN_SHOW, never over the next line.
-            val e = start + min(max(l.endMs + HOLD_MS, l.startMs + MIN_SHOW_MS), nextStart - 40)
+            val e = readFrom + min(max(l.endMs + HOLD_MS, l.startMs + MIN_SHOW_MS), nextStart - 40)
             if (e <= s) null
-            else Cue(s, e, l.text, result.lang, l.words.map { w -> Word(start + w.startMs, start + w.endMs, w.text) })
+            else Cue(s, e, l.text, lang, l.words.map { w -> Word(readFrom + w.startMs, readFrom + w.endMs, w.text) })
         }
         markDone(i, start, end, newCues, result.lang)
+    }
+
+    private fun padded(pcm: FloatArray): FloatArray {
+        val pad = (PAD_MS * SAMPLE_RATE / 1000).toInt()
+        return FloatArray(pcm.size + 2 * pad).also { pcm.copyInto(it, pad) }
+    }
+
+    private fun ChunkResult.shifted(by: Long) = copy(lines = lines.map { l ->
+        l.copy(
+            startMs = max(0, l.startMs + by), endMs = max(0, l.endMs + by),
+            words = l.words.map { w -> Word(max(0, w.startMs + by), max(0, w.endMs + by), w.text) },
+        )
+    })
+
+    private fun overlaps(a: Line, b: Line): Boolean {
+        val o = min(a.endMs, b.endMs) - max(a.startMs, b.startMs)
+        return o > 0 && o > 0.5 * min(a.endMs - a.startMs, b.endMs - b.startMs)
     }
 
     /** Start of piece [k]: near k × 30 s, moved to the quietest 200 ms within ±2.5 s. */
@@ -389,7 +454,15 @@ class SubtitleEngine(
         inFlight -= i
         if (lang.isNotBlank()) pieceLang[i] = lang
         pieceLines[i] = newCues.size
-        val merged = cues.value.filterNot { it.startMs >= start && it.startMs < end } + newCues
+        val others = cues.value.filterNot { it.startMs >= start && (it.startMs < end || i == done.size - 1) }
+        // Near the piece edges, skip a line the neighbouring piece already has (same words heard twice).
+        val fresh = newCues.filter { c ->
+            (c.startMs - start > 2_500 && end - c.endMs > 2_500) || others.none { o ->
+                val ov = min(o.endMs, c.endMs) - max(o.startMs, c.startMs)
+                ov > 0 && ov > 0.5 * min(o.endMs - o.startMs, c.endMs - c.startMs)
+            }
+        }
+        val merged = others + fresh
         publish(merged)
         runCatching { cache.save(key, done.indices.filter { done[it] }.toSet(), cues.value) }
     }
@@ -445,6 +518,35 @@ private class VoiceMap(pcm: FloatArray) {
         val loud = if (sorted.isEmpty()) 0f else sorted[(sorted.size * 0.9).toInt().coerceIn(0, sorted.size - 1)]
         val thr = max(noise * 2.5f, noise + (loud - noise) * 0.12f).coerceAtLeast(0.004f)
         voiced = BooleanArray(n) { energy[it] > thr }
+    }
+
+    /** Stretches (relative ms) of at least [minMs] that are mostly voice but have no line. */
+    fun uncovered(lines: List<Line>, from: Long, to: Long, minMs: Long): List<Pair<Long, Long>> {
+        if (voiced.isEmpty() || to <= from) return emptyList()
+        val covered = BooleanArray(voiced.size)
+        for (l in lines) for (f in (l.startMs / frameMs).toInt()..(l.endMs / frameMs).toInt())
+            if (f in covered.indices) covered[f] = true
+        val out = mutableListOf<Pair<Long, Long>>()
+        var gapStart = -1
+        var voicedFrames = 0
+        val first = (from / frameMs).toInt().coerceIn(0, voiced.size)
+        val lastF = (to / frameMs).toInt().coerceIn(0, voiced.size)
+        fun close(f: Int) {
+            if (gapStart < 0) return
+            val len = f - gapStart
+            if (len * frameMs >= minMs && voicedFrames >= len * 0.35) {
+                // split long gaps into ≤ 30 s parts
+                var a = gapStart
+                while (a < f) { val b = min(f, a + 30_000 / frameMs); out += a * frameMs.toLong() to b * frameMs.toLong(); a = b }
+            }
+            gapStart = -1; voicedFrames = 0
+        }
+        for (f in first until lastF) {
+            if (covered[f]) close(f)
+            else { if (gapStart < 0) gapStart = f; if (voiced[f]) voicedFrames++ }
+        }
+        close(lastF)
+        return out
     }
 
     private fun isVoiced(ms: Long): Boolean {
