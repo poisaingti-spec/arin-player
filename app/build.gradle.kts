@@ -72,6 +72,7 @@ android {
         jniLibs {
             useLegacyPackaging = true
             pickFirsts += "**/libc++_shared.so"
+            pickFirsts += "**/libonnxruntime.so"
         }
         resources {
             excludes += setOf("META-INF/DEPENDENCIES", "META-INF/LICENSE*", "META-INF/NOTICE*", "META-INF/*.kotlin_module")
@@ -94,6 +95,10 @@ dependencies {
     implementation("org.videolan.android:libvlc-all:3.6.0")
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // Meta Omnilingual ASR (1,600+ languages) on the phone via sherpa-onnx.
+    // The .aar is downloaded by the GitHub build (see .github/workflows/build.yml).
+    implementation(files("libs/sherpa-onnx.aar"))
 
     // Free on-device translation (Google ML Kit) for offline / backup subtitles
     implementation("com.google.mlkit:translate:17.0.3")

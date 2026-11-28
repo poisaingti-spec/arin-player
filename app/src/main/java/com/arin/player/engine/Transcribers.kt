@@ -33,7 +33,12 @@ import java.util.concurrent.TimeUnit
 data class Line(val startMs: Long, val endMs: Long, val text: String, val words: List<Word> = emptyList())
 
 /** [lang] = detected spoken language as an upper-case code ("JA", "HI"…). */
-data class ChunkResult(val lang: String, val lines: List<Line>)
+data class ChunkResult(
+    val lang: String,
+    val lines: List<Line>,
+    /** Whisper's average log-probability (0 = sure). Very low = it probably doesn't know this language. */
+    val confidence: Float = 0f,
+)
 
 /**
  * Speech recogniser. Step 1 of 2: [transcribe] writes down what is said, in the language spoken,
@@ -137,9 +142,11 @@ class CloudTranscriber(private val provider: CloudProvider, private val apiKey: 
         // Segments Whisper itself flags as silence/noise ("Thank you." hallucinations): drop their words.
         val bad = mutableListOf<LongRange>()
         val segs = mutableListOf<Line>()
+        var lpSum = 0.0; var lpN = 0
         o.optJSONArray("segments")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val s = arr.getJSONObject(i)
+                if (s.has("avg_logprob")) { lpSum += s.optDouble("avg_logprob"); lpN++ }
                 val st = (s.getDouble("start") * 1000).toLong()
                 val en = (s.getDouble("end") * 1000).toLong()
                 if (isSilentSeg(s)) bad += st..en
@@ -156,7 +163,8 @@ class CloudTranscriber(private val provider: CloudProvider, private val apiKey: 
                 if (text.isNotEmpty() && bad.none { st in it }) words += Word(st, en, text)
             }
         }
-        return ChunkResult(lang, if (words.isNotEmpty()) LineBuilder.fromWords(words, lang) else segs)
+        return ChunkResult(lang, if (words.isNotEmpty()) LineBuilder.fromWords(words, lang) else segs,
+            if (lpN > 0) (lpSum / lpN).toFloat() else 0f)
     }
 
     override suspend fun audioToEnglish(pcm: FloatArray): ChunkResult {
@@ -218,9 +226,11 @@ class CloudflareTranscriber(private val accountId: String, private val token: St
         val lang = langCode(r.optJSONObject("transcription_info")?.optString("language").orEmpty())
         val words = mutableListOf<Word>()
         val segs = mutableListOf<Line>()
+        var lpSum = 0.0; var lpN = 0
         r.optJSONArray("segments")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val s = arr.getJSONObject(i)
+                if (s.has("avg_logprob")) { lpSum += s.optDouble("avg_logprob"); lpN++ }
                 if (isSilentSeg(s)) continue
                 val text = s.optString("text").trim()
                 if (text.isNotBlank()) segs += Line((s.getDouble("start") * 1000).toLong(), (s.getDouble("end") * 1000).toLong(), text)
@@ -233,7 +243,8 @@ class CloudflareTranscriber(private val accountId: String, private val token: St
                 }
             }
         }
-        return ChunkResult(lang, if (wordsWanted && words.isNotEmpty()) LineBuilder.fromWords(words, lang) else segs)
+        return ChunkResult(lang, if (wordsWanted && words.isNotEmpty()) LineBuilder.fromWords(words, lang) else segs,
+            if (lpN > 0) (lpSum / lpN).toFloat() else 0f)
     }
 }
 
@@ -342,7 +353,8 @@ interface LineTranslator {
 class ChatTranslator(private val provider: CloudProvider, private val apiKey: String) : LineTranslator {
     override suspend fun toEnglish(lines: List<String>, lang: String): List<String>? {
         val sys = "You translate video subtitles into natural, fluent, everyday English. " +
-            "The input is JSON {\"lines\": [...]} spoken mostly in language code $lang (lines may mix languages). " +
+            "The input is JSON {\"lines\": [...]}: a transcript of speech in $lang (lines may mix languages; " +
+            "the transcript may be phonetic or contain recognition errors — infer the most likely meaning). " +
             "Reply with ONLY JSON {\"en\": [...]} containing exactly ${lines.size} strings: the English for each " +
             "input line, same order, one-to-one. Never merge, split, skip or add lines. Keep lines short. " +
             "Lines already in English stay as they are. Use the neighbouring lines as context."

@@ -78,6 +78,8 @@ import org.videolan.libvlc.Media
 import org.videolan.libvlc.MediaPlayer
 import org.videolan.libvlc.util.VLCVideoLayout
 import java.util.Locale
+import com.arin.player.data.Languages
+import com.arin.player.engine.WorldModel
 import androidx.activity.compose.BackHandler
 import androidx.compose.material.icons.filled.ViewInAr
 import com.arin.player.vr.VrScreen
@@ -188,7 +190,11 @@ private fun PlayerContent(
     val libVlc = remember { LibVLC(ctx, arrayListOf("--audio-time-stretch", "--avcodec-skiploopfilter=0")) }
     val player = remember { MediaPlayer(libVlc) }
     val videoLayout = remember { VLCVideoLayout(ctx) }
-    val engine = remember { SubtitleEngine(ctx, source, libVlc, scope) }
+    // Spoken language for this video (picked in the ⋮ menu); changing it restarts the subtitles
+    var spokenLang by remember { mutableStateOf(Languages.byCode(settings.videoLanguage(source.cacheId))) }
+    var showLangPicker by remember { mutableStateOf(false) }
+    val engine = remember(spokenLang) { SubtitleEngine(ctx, source, libVlc, scope, spokenLang) }
+    DisposableEffect(engine) { onDispose { engine.stop() } }
     val title = source.title
 
     var isPlaying by remember { mutableStateOf(false) }
@@ -301,7 +307,7 @@ private fun PlayerContent(
     // ---- start subtitles once the video is actually playing, so they don't slow its start
     var everPlayed by remember { mutableStateOf(false) }
     LaunchedEffect(isPlaying) { if (isPlaying) everPlayed = true }
-    LaunchedEffect(everPlayed, lenMs) {
+    LaunchedEffect(everPlayed, lenMs, engine) {
         if (everPlayed && lenMs > 0) {
             if (!source.isLocal) delay(4_000) // let the video fill its buffer first
             engine.start(lenMs)
@@ -400,6 +406,10 @@ private fun PlayerContent(
                                 text = { Text("Export subtitles (.srt)") },
                                 enabled = cues.isNotEmpty(),
                                 onClick = { menuOpen = false; exporter.launch(title.substringBeforeLast('.') + ".en.srt") },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Spoken language: ${spokenLang.name}") },
+                                onClick = { menuOpen = false; showLangPicker = true },
                             )
                             DropdownMenuItem(text = { Text("VR mode") }, onClick = { menuOpen = false; showVrSetup = true })
                             DropdownMenuItem(text = { Text("Settings") }, onClick = { menuOpen = false; onSettings() })
@@ -500,6 +510,21 @@ private fun PlayerContent(
                 onExit = { vrOn = false },
             )
         }
+    }
+
+    if (showLangPicker) {
+        LanguagePickerDialog(
+            current = spokenLang,
+            worldModelReady = WorldModel.isReady(ctx),
+            onPick = { l ->
+                showLangPicker = false
+                if (l.code != spokenLang.code) {
+                    settings.setVideoLanguage(source.cacheId, l.code)
+                    spokenLang = l
+                }
+            },
+            onDismiss = { showLangPicker = false },
+        )
     }
 
     if (showVrSetup) {

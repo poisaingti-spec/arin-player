@@ -22,6 +22,13 @@ jobs:
         with:
           gradle-version: "8.11.1"
 
+      - name: Get sherpa-onnx (world languages speech engine)
+        run: |
+          mkdir -p app/libs
+          curl -fsSL -o app/libs/sherpa-onnx.aar \
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/sherpa-onnx-static-link-onnxruntime-1.13.8.aar
+          ls -la app/libs
+
       - name: Restore signing key
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}

@@ -48,6 +48,8 @@ import com.arin.player.data.EngineMode
 import com.arin.player.data.LocalModel
 import com.arin.player.data.Settings
 import com.arin.player.engine.ModelManager
+import com.arin.player.engine.WorldModel
+import com.arin.player.data.Languages
 import com.arin.player.online.OnlineResolver
 import androidx.compose.runtime.rememberCoroutineScope
 import kotlinx.coroutines.launch
@@ -75,6 +77,11 @@ fun SettingsScreen(onClose: () -> Unit) {
     val dlErrors by ModelManager.errors.collectAsState()
     val updateState by Updater.state.collectAsState()
     val engineStatus by OnlineResolver.engineStatus.collectAsState()
+    var defaultLang by remember { mutableStateOf(s.defaultLanguage) }
+    var showLangPicker by remember { mutableStateOf(false) }
+    val worldProg by WorldModel.progress.collectAsState()
+    val worldErr by WorldModel.error.collectAsState()
+    val worldReady = remember(refresh, worldProg) { WorldModel.isReady(ctx) }
     val scope = rememberCoroutineScope()
 
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
@@ -162,6 +169,35 @@ fun SettingsScreen(onClose: () -> Unit) {
                 }
             }
 
+            Section("Spoken language & regional languages")
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.weight(1f)) {
+                    Text("Default spoken language: ${Languages.byCode(defaultLang).name}")
+                    Text("You can also change it per video in the player's ⋮ menu", fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
+                }
+                TextButton(onClick = { showLangPicker = true }) { Text("Change") }
+            }
+            Spacer(Modifier.height(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.weight(1f)) {
+                    Text("World languages model · ${WorldModel.SIZE_MB} MB")
+                    Text(
+                        worldErr?.let { "Failed: $it" }
+                            ?: "Meta's 1,600+ language speech model, on the phone: Khasi, Mizo, Garo, Bodo, Manipuri, " +
+                            "Kokborok, Nagamese, Odia, Bhojpuri, Maithili, Konkani, Tulu and many more. Also used " +
+                            "automatically when a language isn't recognised.",
+                        fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                    )
+                }
+                when {
+                    worldProg != null -> TextButton(onClick = { WorldModel.cancel() }) { Text("Cancel") }
+                    worldReady -> TextButton(onClick = { WorldModel.delete(ctx); refresh++ }) { Text("Delete") }
+                    else -> TextButton(onClick = { WorldModel.download(ctx) }) { Text("Download") }
+                }
+            }
+            worldProg?.let { LinearProgressIndicator(progress = { it }, modifier = Modifier.fillMaxWidth().padding(top = 4.dp)) }
+
             Section("Subtitles")
             Text("Text size: ${subSize.toInt()} sp")
             Slider(value = subSize, onValueChange = { subSize = it; s.subtitleSizeSp = it }, valueRange = 14f..34f)
@@ -201,6 +237,14 @@ fun SettingsScreen(onClose: () -> Unit) {
             }
             Spacer(Modifier.height(32.dp))
         }
+    }
+    if (showLangPicker) {
+        LanguagePickerDialog(
+            current = Languages.byCode(defaultLang),
+            worldModelReady = worldReady,
+            onPick = { l -> s.defaultLanguage = l.code; defaultLang = l.code; showLangPicker = false },
+            onDismiss = { showLangPicker = false },
+        )
     }
 }
 

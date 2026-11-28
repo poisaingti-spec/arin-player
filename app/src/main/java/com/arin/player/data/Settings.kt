@@ -83,6 +83,14 @@ class Settings(context: Context) {
 
     fun addRecentUrl(url: String) { recentUrls = listOf(url) + recentUrls.filter { it != url } }
 
+    // ---- Spoken language
+    /** Default spoken language for new videos ("auto" = detect). */
+    var defaultLanguage: String
+        get() = p.getString("spoken_lang", "auto")!!
+        set(v) = p.edit().putString("spoken_lang", v).apply()
+    fun videoLanguage(videoId: String): String = p.getString("vlang_" + videoId.hashCode(), null) ?: defaultLanguage
+    fun setVideoLanguage(videoId: String, code: String) = p.edit().putString("vlang_" + videoId.hashCode(), code).apply()
+
     // ---- VR
     var vrFormat: VrFormat
         get() = runCatching { VrFormat.valueOf(p.getString("vr_format", null)!!) }.getOrDefault(VrFormat.AUTO)

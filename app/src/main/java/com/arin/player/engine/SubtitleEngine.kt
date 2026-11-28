@@ -10,6 +10,8 @@ import com.arin.player.data.Settings
 import com.arin.player.data.SubtitleCache
 import com.arin.player.data.Word
 import com.arin.player.online.PlaybackSource
+import com.arin.player.data.Languages
+import com.arin.player.data.SpokenLanguage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -51,6 +53,8 @@ class SubtitleEngine(
     private val source: PlaybackSource,
     private val libVlc: LibVLC,
     private val scope: CoroutineScope,
+    /** Spoken language chosen by the user for this video ([Languages.AUTO] = detect). */
+    private val language: SpokenLanguage = Languages.AUTO,
 ) {
     companion object {
         /** 60 s pieces: half the requests of 30 s, so the free cloud limit goes twice as far. */
@@ -66,6 +70,8 @@ class SubtitleEngine(
         const val PAD_MS = 700L
         /** A stretch of voice this long with no subtitle is heard again on its own. */
         const val GAP_MS = 3_500L
+        /** Average log-probability below this = Whisper is guessing (unknown language). */
+        const val LOW_CONFIDENCE = -1.05f
     }
 
     private val ctx = context.applicationContext
@@ -112,7 +118,7 @@ class SubtitleEngine(
         durationMs = videoDurationMs
         val n = ((durationMs + CHUNK_MS - 1) / CHUNK_MS).toInt()
         done = BooleanArray(n)
-        key = cache.key(source.cacheId, durationMs)
+        key = cache.key(source.cacheId + "|" + language.code, durationMs)
         cache.load(key)?.let { (d, c) ->
             d.filter { it < n }.forEach { done[it] = true }
             // rebuild per-piece language info from the cached lines
@@ -337,11 +343,21 @@ class SubtitleEngine(
      *         else the recogniser's own audio translation).
      */
     private suspend fun recognise(pcm: FloatArray, start: Long, end: Long): ChunkResult {
+        // A language only the world model knows (e.g. Khasi, Mizo, Nagamese, Karbi…)
+        if (language.usesWorldModel && language != Languages.AUTO) {
+            if (!WorldModel.isReady(ctx)) throw IllegalStateException(
+                "${language.name} needs the World languages model — download it in Settings")
+            status.value = "Listening ${fmt(start)}–${fmt(end)} (${language.name})"
+            val code = if (language.code == "OTHER") "" else language.code
+            val heard = WorldTranscriber(ctx, code).transcribe(pcm, code.ifBlank { null })
+            return finishTranslation(null, pcm, heard, start, end)
+        }
         var last: Exception? = null
         for (t in candidates()) {
             status.value = "Listening ${fmt(start)}–${fmt(end)} (${t.label})"
+            val forced = language.whisper?.uppercase()
             val heard = try {
-                t.transcribe(pcm)
+                t.transcribe(pcm, forced)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -351,26 +367,35 @@ class SubtitleEngine(
                 continue
             }
             var heard2 = heard
-            // Whisper sometimes "hears" a random language in music / quiet parts (Norwegian, Khmer…).
-            // Once the video's main language is clear, a piece with few lines in another language is
-            // re-heard as the main language.
-            val main = mainLanguage()
-            if (main != null && heard.lang != main && heard.lines.size < 6) {
-                runCatching { t.transcribe(pcm, main) }.getOrNull()?.let { heard2 = it }
+            if (language == Languages.AUTO) {
+                // Whisper doesn't know this language at all (very low confidence): if the world model
+                // is on the phone, let it write down the speech instead.
+                if (heard.lines.isNotEmpty() && heard.confidence < LOW_CONFIDENCE && WorldModel.isReady(ctx)) {
+                    status.value = "Listening ${fmt(start)}–${fmt(end)} (world languages)"
+                    val w = runCatching { WorldTranscriber(ctx, null).transcribe(pcm, null) }.getOrNull()
+                    if (w != null && w.lines.isNotEmpty()) return finishTranslation(null, pcm, w, start, end)
+                }
+                // Whisper sometimes "hears" a random language in music / quiet parts (Norwegian, Khmer…).
+                // Once the video's main language is clear, a piece with few lines in another language is
+                // re-heard as the main language.
+                val main = mainLanguage()
+                if (main != null && heard.lang != main && heard.lines.size < 6) {
+                    runCatching { t.transcribe(pcm, main) }.getOrNull()?.let { heard2 = it }
+                }
             }
             return finishTranslation(t, pcm, heard2, start, end)
         }
         throw last ?: IllegalStateException("No subtitle engine available")
     }
 
-    private suspend fun finishTranslation(t: Transcriber, pcm: FloatArray, heard: ChunkResult, start: Long, end: Long): ChunkResult {
+    private suspend fun finishTranslation(t: Transcriber?, pcm: FloatArray, heard: ChunkResult, start: Long, end: Long): ChunkResult {
         if (heard.lines.isEmpty() || heard.lang == "EN") return heard
         status.value = "Translating ${fmt(start)}–${fmt(end)}"
         val english = translateLines(heard.lines.map { it.text }, heard.lang)
         if (english != null) {
             return ChunkResult(heard.lang, heard.lines.mapIndexed { i, l -> Line(l.startMs, l.endMs, english[i]) })
         }
-        val direct = runCatching { t.audioToEnglish(pcm) }.getOrNull()
+        val direct = runCatching { t?.audioToEnglish(pcm) }.getOrNull()
         return if (direct != null && direct.lines.isNotEmpty()) direct.copy(lang = heard.lang)
         else heard.copy(lines = heard.lines.map { it.copy(words = emptyList()) }) // original language
     }
@@ -399,11 +424,18 @@ class SubtitleEngine(
 
     private suspend fun translateLines(lines: List<String>, lang: String): List<String>? {
         val key = settings.apiKey()
-        if (key.isNotBlank() && settings.mode != EngineMode.OFFLINE && online()) {
-            runCatching { ChatTranslator(settings.provider, key).toEnglish(lines, lang) }
+        val name = when {
+            lang.isBlank() -> "an unidentified language (possibly a regional language of India, e.g. from North-East India)"
+            else -> Languages.nameOf(lang).let { n ->
+                val l = Languages.byCode(lang)
+                if (l.region.isNotBlank()) "$n (spoken in ${l.region}, India)" else n
+            }
+        }
+        if (key.isNotBlank() && online()) {
+            runCatching { ChatTranslator(settings.provider, key).toEnglish(lines, name) }
                 .getOrNull()?.let { return it }
         }
-        if (MlKitTranslator.supports(lang)) {
+        if (lang.isNotBlank() && MlKitTranslator.supports(lang)) {
             runCatching { MlKitTranslator.toEnglish(lines, lang) }.getOrNull()?.let { return it }
         }
         return null
